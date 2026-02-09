@@ -1,0 +1,48 @@
+{
+  "name": "mcp-winuae-emu",
+  "version": "0.1.0",
+  "description": "MCP server for debugging Amiga 68k programs in WinUAE via GDB RSP protocol",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-winuae-emu": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "winuae",
+    "amiga",
+    "68k",
+    "m68k",
+    "emulator",
+    "debugging",
+    "gdb",
+    "retro",
+    "commodore"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}
