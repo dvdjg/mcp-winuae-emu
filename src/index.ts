@@ -107,9 +107,12 @@ const M68K_OPCODES: Record<number, string> = {
 function parseHexOrDecimal(value: string | number): number {
   if (typeof value === 'number') return value;
   const s = value.trim();
-  if (s.startsWith('$')) return parseInt(s.slice(1), 16);
-  if (s.startsWith('0x') || s.startsWith('0X')) return parseInt(s.slice(2), 16);
-  return parseInt(s, 10);
+  let result: number;
+  if (s.startsWith('$')) result = parseInt(s.slice(1), 16);
+  else if (s.startsWith('0x') || s.startsWith('0X')) result = parseInt(s.slice(2), 16);
+  else result = parseInt(s, 10);
+  if (isNaN(result)) throw new Error(`Invalid address/value: "${value}"`);
+  return result;
 }
 
 function hex32(v: number): string {
@@ -288,16 +291,10 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_reset',
-    description: 'Reset the Amiga. Sends a break and re-reads registers.',
+    description: 'Pause the Amiga CPU and read current register state.',
     inputSchema: {
       type: 'object',
-      properties: {
-        hard: {
-          type: 'boolean',
-          description: 'True for hard reset (default: false)',
-          default: false,
-        },
-      },
+      properties: {},
     },
   },
 
@@ -373,7 +370,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_registers_set',
-    description: 'Set m68k CPU registers. Provide any subset of D0-D7, A0-A7, SR, PC as hex or decimal values.',
+    description: 'Set m68k CPU registers. Provide any subset of D0-D7, A0-A7, SR, PC.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -669,32 +666,29 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const protocol = connection.getProtocol();
 
-        // Read current registers first
-        const current = await protocol.readRegisters();
+        // Register name to GDB index mapping
+        const REG_INDEX: Record<string, number> = {
+          D0: 0, D1: 1, D2: 2, D3: 3, D4: 4, D5: 5, D6: 6, D7: 7,
+          A0: 8, A1: 9, A2: 10, A3: 11, A4: 12, A5: 13, A6: 14, A7: 15,
+          SR: 16, PC: 17,
+        };
 
-        // Merge in provided values
-        const regNames: (keyof M68kRegisters)[] = [
-          'D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7',
-          'A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7',
-          'SR', 'PC',
-        ];
-
-        // Use individual register writes for each provided register
-        const updated: string[] = [];
-        for (const name of regNames) {
-          if (args[name] !== undefined) {
-            const value = parseHexOrDecimal(args[name]);
-            const idx = regNames.indexOf(name);
-            await protocol.writeRegister(idx, value);
-            updated.push(`${name}=${hex32(value)}`);
-          }
+        const written: string[] = [];
+        for (const [regName, rawValue] of Object.entries(args)) {
+          if (rawValue === undefined || rawValue === null) continue;
+          const idx = REG_INDEX[regName];
+          if (idx === undefined) continue;
+          const value = parseHexOrDecimal(rawValue as string | number);
+          await protocol.writeRegister(idx, value);
+          written.push(`${regName}=${hex32(value)}`);
         }
 
-        if (updated.length === 0) {
-          return { content: [{ type: 'text', text: 'No registers specified' }] };
+        if (written.length === 0) {
+          return { content: [{ type: 'text', text: 'No registers specified to write' }] };
         }
 
-        return { content: [{ type: 'text', text: `Updated: ${updated.join(', ')}` }] };
+        const regs = await protocol.readRegisters();
+        return { content: [{ type: 'text', text: `Set ${written.join(', ')}\n${formatRegisters(regs)}` }] };
       }
 
       case 'winuae_breakpoint_set': {
@@ -736,9 +730,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const { count = 1 } = args;
         const protocol = connection.getProtocol();
 
-        let stopReply = '';
         for (let i = 0; i < count; i++) {
-          stopReply = await protocol.step();
+          await protocol.step();
         }
 
         const regs = await protocol.readRegisters();
@@ -748,9 +741,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
       case 'winuae_continue': {
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const protocol = connection.getProtocol();
-        const stopReply = await protocol.continue();
-        const regs = await protocol.readRegisters();
-        return { content: [{ type: 'text', text: `Stopped (${stopReply})\n${formatRegisters(regs)}` }] };
+        await protocol.continue();
+        return { content: [{ type: 'text', text: 'Execution resumed. Use winuae_pause to stop.' }] };
       }
 
       case 'winuae_pause': {

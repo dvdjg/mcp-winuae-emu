@@ -16,7 +16,7 @@ This server lets an AI assistant (Claude, etc.) launch WinUAE, connect to its GD
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/axewater/mcp-winuae-emu.git
 cd mcp-winuae-emu
 npm install
 npm run build
@@ -89,11 +89,11 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 | Tool | Description |
 |---|---|
 | `winuae_registers_get` | Read all m68k registers (D0-D7, A0-A7, SR, PC). |
-| `winuae_registers_set` | Write any subset of registers. |
+| `winuae_registers_set` | Write registers (any subset of D0-D7, A0-A7, SR, PC). |
 | `winuae_step` | Single-step N instructions. |
-| `winuae_continue` | Resume execution until breakpoint/watchpoint. |
-| `winuae_pause` | Pause execution. |
-| `winuae_reset` | Pause and read current state. |
+| `winuae_continue` | Resume execution (fire-and-forget). Use `winuae_pause` to stop. |
+| `winuae_pause` | Pause execution. Returns registers and any pending stop reason. |
+| `winuae_reset` | Pause CPU and read current register state. |
 
 ### Breakpoints & Watchpoints
 

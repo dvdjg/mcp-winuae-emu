@@ -3,9 +3,9 @@
  * Connects to BartmanAbyss WinUAE fork with GDB RSP server
  *
  * The Bartman fork (winuae-gdb.exe) requires portable mode:
- *   1. Write a default.uae alongside the exe with all settings
- *   2. Launch with -portable flag
- *   3. Config must include use_gui=no to skip the settings panel
+ *   1. Write a default.uae alongside the exe with hardware settings
+ *   2. Launch with -portable -G -s debugging_features=gdbserver -s debugging_trigger=
+ *   3. The -G flag suppresses the settings panel (use_gui=no in config does NOT work)
  * The GDB server listens on port 2345 by default.
  */
 
@@ -177,7 +177,14 @@ export class WinUAEConnection {
     });
 
     // Wait for GDB server to become available
-    await this.waitForGdb();
+    try {
+      await this.waitForGdb();
+    } catch (err) {
+      // Close log fd and clean up if GDB connection fails after launch
+      try { fs.closeSync(logFd); } catch {}
+      this.cleanup();
+      throw err;
+    }
   }
 
   /**

@@ -39,6 +39,8 @@ export class GdbProtocol {
   }> = [];
   private debugMode = process.env.WINUAE_DEBUG === '1';
   private pendingData = '';
+  private _isRunning = false;
+  private pendingStopReply: string | null = null;
 
   /**
    * Connect to GDB server and perform handshake
@@ -63,6 +65,10 @@ export class GdbProtocol {
     });
 
     this.socket.on('data', (data) => this.handleData(data));
+    this.socket.on('error', (err) => {
+      this.debug(`[GDB] Socket error: ${err.message}`);
+      this.rejectAll(new Error(`Socket error: ${err.message}`));
+    });
     this.socket.on('close', () => {
       this.debug('[GDB] Socket closed');
       this.rejectAll(new Error('Socket closed'));
@@ -152,9 +158,21 @@ export class GdbProtocol {
 
       // O packets are async console output from GDB server -- log and skip
       if (packetData.startsWith('O')) {
-        const hexText = packetData.slice(1);
-        const text = Buffer.from(hexText, 'hex').toString('utf8').trim();
-        this.debug(`[GDB] Server output: ${text}`);
+        try {
+          const hexText = packetData.slice(1);
+          const text = Buffer.from(hexText, 'hex').toString('utf8').trim();
+          this.debug(`[GDB] Server output: ${text}`);
+        } catch {
+          this.debug(`[GDB] Server output (raw): ${packetData.slice(1, 50)}`);
+        }
+        continue;
+      }
+
+      // Async stop replies (S/T packets) when CPU was running with no resolver waiting
+      if ((packetData.startsWith('S') || packetData.startsWith('T')) && this.packetResolvers.length === 0) {
+        this.pendingStopReply = packetData;
+        this._isRunning = false;
+        this.debug(`[GDB] Async stop reply: ${packetData}`);
         continue;
       }
 
@@ -162,6 +180,10 @@ export class GdbProtocol {
       const resolver = this.packetResolvers.shift();
       if (resolver) {
         clearTimeout(resolver.timer);
+        // Track stop for run commands
+        if (packetData.startsWith('S') || packetData.startsWith('T')) {
+          this._isRunning = false;
+        }
         resolver.resolve(packetData);
       } else {
         this.debug(`[GDB] Unsolicited packet: ${packetData.slice(0, 50)}`);
@@ -257,21 +279,6 @@ export class GdbProtocol {
   }
 
   /**
-   * Write all registers
-   */
-  async writeRegisters(regs: M68kRegisters): Promise<void> {
-    let hex = '';
-    for (let i = 0; i < 18; i++) {
-      const value = (regs as any)[REGISTER_NAMES[i]] as number;
-      hex += value.toString(16).padStart(8, '0');
-    }
-    const reply = await this.sendCommand(`G${hex}`);
-    if (reply !== 'OK') {
-      throw new Error(`Write registers failed: ${reply}`);
-    }
-  }
-
-  /**
    * Read a single register by index
    */
   async readRegister(id: number): Promise<number> {
@@ -280,14 +287,24 @@ export class GdbProtocol {
   }
 
   /**
-   * Write a single register by index
+   * Write a single register by index: sends 'P<id>=<hex>'
    */
   async writeRegister(id: number, value: number): Promise<void> {
-    const hex = value.toString(16).padStart(8, '0');
+    const hex = (value >>> 0).toString(16).padStart(8, '0');
     const reply = await this.sendCommand(`P${id.toString(16)}=${hex}`);
-    if (reply !== 'OK') {
-      throw new Error(`Write register ${id} failed: ${reply}`);
+    if (reply !== 'OK') throw new Error(`Register write failed for reg ${id}: ${reply}`);
+  }
+
+  /**
+   * Write all registers: sends 'G<hex>' (18 regs × 8 hex chars)
+   */
+  async writeRegisters(regs: M68kRegisters): Promise<void> {
+    let hex = '';
+    for (const name of REGISTER_NAMES) {
+      hex += ((regs[name] as number) >>> 0).toString(16).padStart(8, '0');
     }
+    const reply = await this.sendCommand(`G${hex}`);
+    if (reply !== 'OK') throw new Error(`Register write-all failed: ${reply}`);
   }
 
   // ─── Memory Commands ────────────────────────────────────────────────
@@ -363,23 +380,43 @@ export class GdbProtocol {
   // ─── Execution Control ──────────────────────────────────────────────
 
   /**
-   * Continue execution: sends 'c', waits for stop reply
+   * Continue execution: sends 'c', returns immediately (fire-and-forget).
+   * The stop reply will arrive asynchronously when a breakpoint/watchpoint fires.
+   * Use pause() to stop execution, or check isRunning to see if already stopped.
    */
-  async continue(): Promise<string> {
-    return this.sendRunCommand('c');
+  async continue(): Promise<void> {
+    this.pendingStopReply = null;
+    this._isRunning = true;
+    this.sendPacket('c');
   }
 
   /**
-   * Single step: sends 's', waits for stop reply
+   * Single step: sends 's', waits for stop reply (step always stops quickly)
    */
   async step(): Promise<string> {
-    return this.sendRunCommand('s');
+    this._isRunning = true;
+    const reply = await this.sendRunCommand('s');
+    this._isRunning = false;
+    return reply;
   }
 
   /**
-   * Pause/interrupt: sends raw 0x03 byte, waits for stop reply
+   * Pause/interrupt execution. If CPU already stopped (async breakpoint hit),
+   * returns the pending stop reply immediately. Otherwise sends 0x03 interrupt.
    */
   async pause(): Promise<string> {
+    // If a stop reply arrived asynchronously (breakpoint fired), return it
+    if (this.pendingStopReply) {
+      const reply = this.pendingStopReply;
+      this.pendingStopReply = null;
+      return reply;
+    }
+
+    // If not running, just return
+    if (!this._isRunning) {
+      return 'S00';
+    }
+
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const idx = this.packetResolvers.findIndex(r => r.resolve === resolve);
@@ -396,6 +433,13 @@ export class GdbProtocol {
         this.socket.write(Buffer.from([0x03]));
       }
     });
+  }
+
+  /**
+   * Whether the CPU is currently running (continue was sent, no stop reply yet)
+   */
+  get isRunning(): boolean {
+    return this._isRunning;
   }
 
   /**
