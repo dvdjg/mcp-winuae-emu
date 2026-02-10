@@ -245,6 +245,14 @@ function disassembleM68k(data: Buffer, baseAddr: number, count: number): string 
   return lines.join('\n');
 }
 
+// ─── Disk Image Detection ────────────────────────────────────────────
+
+const DISK_IMAGE_EXTENSIONS = new Set(['.adf', '.adz', '.dms', '.ipf', '.fdi', '.scp']);
+
+function isDiskImage(filePath: string): boolean {
+  return DISK_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
 // ─── Tool Definitions ────────────────────────────────────────────────
 
 const tools: Tool[] = [
@@ -295,6 +303,41 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+
+  // Disk tools
+  {
+    name: 'winuae_insert_disk',
+    description: 'Insert a floppy disk image (ADF, ADZ, DMS, IPF) into a drive. Restarts WinUAE to apply. Use drive 0 for DF0: (boot drive).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          description: 'Path to disk image file (.adf, .adz, .dms, .ipf)',
+        },
+        drive: {
+          type: 'number',
+          description: 'Drive number 0-3 (default: 0 = DF0:)',
+          default: 0,
+        },
+      },
+      required: ['file'],
+    },
+  },
+  {
+    name: 'winuae_eject_disk',
+    description: 'Eject floppy disk from a drive. Restarts WinUAE to apply.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        drive: {
+          type: 'number',
+          description: 'Drive number 0-3 (default: 0 = DF0:)',
+          default: 0,
+        },
+      },
     },
   },
 
@@ -564,7 +607,9 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (connection?.connected) {
           return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
         }
-        connection = new WinUAEConnection(config);
+        if (!connection) {
+          connection = new WinUAEConnection(config);
+        }
         const statusMsg = await connection.connectSmart();
         return { content: [{ type: 'text', text: statusMsg }] };
       }
@@ -587,23 +632,38 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
       }
 
       case 'winuae_load': {
-        if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const { file } = args;
-        const { readFileSync } = await import('fs');
+        const { readFileSync, existsSync } = await import('fs');
         const { resolve } = await import('path');
 
         const absPath = resolve(file);
+        if (!existsSync(absPath)) {
+          throw new Error(`File not found: ${absPath}`);
+        }
+
+        // Detect disk images by extension — delegate to disk insertion
+        if (isDiskImage(absPath)) {
+          if (!connection) {
+            connection = new WinUAEConnection(config);
+          }
+          connection.setFloppy(0, absPath);
+          if (connection.connected) {
+            const statusMsg = await connection.restart();
+            return { content: [{ type: 'text', text: `Detected disk image. Inserted ${absPath} into DF0: and restarted.\n${statusMsg}` }] };
+          } else {
+            return { content: [{ type: 'text', text: `Detected disk image. ${absPath} set for DF0:. Call winuae_connect to boot.` }] };
+          }
+        }
+
+        // Original behavior: load binary into memory via GDB
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const fileData = readFileSync(absPath);
         const protocol = connection.getProtocol();
 
-        // Amiga executables (hunk format) start with $000003F3
-        // For raw binaries, load at a default address
-        let loadAddr = 0x40000; // Default load address in chip RAM
+        let loadAddr = 0x40000;
         if (fileData.length >= 4) {
           const magic = fileData.readUInt32BE(0);
           if (magic === 0x000003F3) {
-            // Hunk executable — skip hunk header and load code at default address
-            // A proper loader would parse hunks, but for simple binaries this works
             console.error(`[WinUAE] Detected hunk executable: ${absPath}`);
           }
         }
@@ -624,6 +684,47 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         }
         const regs = await protocol.readRegisters();
         return { content: [{ type: 'text', text: `CPU paused\n${formatRegisters(regs)}` }] };
+      }
+
+      case 'winuae_insert_disk': {
+        const { file, drive = 0 } = args;
+        const { existsSync } = await import('fs');
+        const { resolve } = await import('path');
+
+        const absPath = resolve(file);
+        if (!existsSync(absPath)) {
+          throw new Error(`File not found: ${absPath}`);
+        }
+
+        if (!connection) {
+          connection = new WinUAEConnection(config);
+        }
+
+        connection.setFloppy(drive, absPath);
+
+        if (connection.connected) {
+          const statusMsg = await connection.restart();
+          return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: and restarted.\n${statusMsg}` }] };
+        } else {
+          return { content: [{ type: 'text', text: `Disk ${absPath} set for DF${drive}:. Will be mounted on next winuae_connect.` }] };
+        }
+      }
+
+      case 'winuae_eject_disk': {
+        const { drive = 0 } = args;
+
+        if (!connection) {
+          return { content: [{ type: 'text', text: 'No connection. Nothing to eject.' }] };
+        }
+
+        connection.setFloppy(drive, null);
+
+        if (connection.connected) {
+          const statusMsg = await connection.restart();
+          return { content: [{ type: 'text', text: `Ejected DF${drive}: and restarted.\n${statusMsg}` }] };
+        } else {
+          return { content: [{ type: 'text', text: `DF${drive}: cleared. Will take effect on next winuae_connect.` }] };
+        }
       }
 
       case 'winuae_memory_read': {

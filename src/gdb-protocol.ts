@@ -380,22 +380,24 @@ export class GdbProtocol {
   // ─── Execution Control ──────────────────────────────────────────────
 
   /**
-   * Continue execution: sends 'c', returns immediately (fire-and-forget).
+   * Continue execution: sends 'vCont;c', returns immediately (fire-and-forget).
    * The stop reply will arrive asynchronously when a breakpoint/watchpoint fires.
    * Use pause() to stop execution, or check isRunning to see if already stopped.
+   * Note: BartmanAbyss WinUAE only supports vCont commands, not basic 'c'.
    */
   async continue(): Promise<void> {
     this.pendingStopReply = null;
     this._isRunning = true;
-    this.sendPacket('c');
+    this.sendPacket('vCont;c');
   }
 
   /**
-   * Single step: sends 's', waits for stop reply (step always stops quickly)
+   * Single step: sends 'vCont;s', waits for stop reply (step always stops quickly)
+   * Note: BartmanAbyss WinUAE only supports vCont commands, not basic 's'.
    */
   async step(): Promise<string> {
     this._isRunning = true;
-    const reply = await this.sendRunCommand('s');
+    const reply = await this.sendRunCommand('vCont;s');
     this._isRunning = false;
     return reply;
   }

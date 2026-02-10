@@ -27,6 +27,7 @@ export class WinUAEConnection {
   private protocol: GdbProtocol | null = null;
   private isConnected = false;
   private logFilePath: string | null = null;
+  private floppies: Map<number, string> = new Map();
 
   constructor(config: WinUAEConfig) {
     this.config = config;
@@ -155,6 +156,11 @@ export class WinUAEConnection {
       '-s', 'debugging_trigger=',
     ];
 
+    // Inject floppy disk settings as CLI overrides
+    for (const [drive, diskPath] of this.floppies) {
+      args.push('-s', `floppy${drive}=${diskPath}`);
+    }
+
     console.error(`[WinUAE] Launching ${exePath} ${args.join(' ')}`);
     console.error(`[WinUAE] GDB port: ${this.config.gdbPort}`);
     console.error(`[WinUAE] Log file: ${this.logFilePath}`);
@@ -275,6 +281,16 @@ export class WinUAEConnection {
   }
 
   /**
+   * Restart WinUAE with updated configuration (preserves floppy state).
+   */
+  async restart(): Promise<string> {
+    console.error('[WinUAE] Restarting with updated configuration...');
+    this.cleanup();
+    await this.connect();
+    return `Restarted WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
+  }
+
+  /**
    * Disconnect and kill WinUAE
    */
   async disconnect(): Promise<void> {
@@ -333,5 +349,22 @@ export class WinUAEConnection {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Set or clear a floppy disk image for a drive (0-3).
+   * Takes effect on next connect() or restart().
+   */
+  setFloppy(drive: number, filePath: string | null): void {
+    if (drive < 0 || drive > 3) throw new Error('Drive must be 0-3');
+    if (filePath) {
+      this.floppies.set(drive, filePath);
+    } else {
+      this.floppies.delete(drive);
+    }
+  }
+
+  getFloppies(): Map<number, string> {
+    return new Map(this.floppies);
   }
 }
