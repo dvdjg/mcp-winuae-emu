@@ -1,6 +1,6 @@
 {
   "name": "mcp-winuae-emu",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "MCP server for debugging Amiga 68k programs in WinUAE via GDB RSP protocol",
   "type": "module",
   "main": "dist/index.js",
