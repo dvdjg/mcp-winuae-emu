@@ -1,19 +1,20 @@
 # mcp-winuae-emu
 
-An [MCP](https://modelcontextprotocol.io/) server that provides Amiga 68k debugging tools through the WinUAE emulator. It connects to the [BartmanAbyss WinUAE fork](https://github.com/BartmanAbyss/WinUAE) via GDB Remote Serial Protocol (RSP), giving AI assistants direct access to the emulated Amiga hardware.
+An [MCP](https://modelcontextprotocol.io/) server that provides Amiga 68k debugging tools through the WinUAE emulator. It connects to a [custom WinUAE fork](https://github.com/axewater/WinUAE/tree/gdb-write-commands) via GDB Remote Serial Protocol (RSP), giving AI assistants direct read-write access to the emulated Amiga hardware.
 
 ## What it does
 
-This server lets an AI assistant (Claude, etc.) launch WinUAE, connect to its GDB server, and then read/write memory, inspect registers, set breakpoints, single-step through code, disassemble Copper lists, and more -- all through MCP tool calls.
+This server lets an AI assistant (Claude, etc.) launch WinUAE, connect to its GDB server, and then read/write memory, read/write registers, set breakpoints, single-step through code, disassemble Copper lists, and more -- all through MCP tool calls.
 
-## Prerequisites
+## Quick Start
 
-- **Node.js** >= 18
-- **WinUAE GDB fork** (`winuae-gdb.exe`) -- the BartmanAbyss build with GDB server support. Get it from the [vscode-amiga-debug](https://github.com/BartmanAbyss/vscode-amiga-debug) extension's `bin/win32` directory.
-- **Kickstart ROM** -- a valid Amiga Kickstart ROM file (e.g., Kickstart 1.3 for A500)
-- **Windows** -- WinUAE is Windows-only (Linux/macOS users can try Wine)
+### 1. Download the pre-built WinUAE binary
 
-## Installation
+Download `winuae-gdb.exe` from the [WinUAE fork releases](https://github.com/axewater/WinUAE/releases) and place it in a directory (e.g., `C:\apps\winuae\`).
+
+This is a custom build of [BartmanAbyss's WinUAE fork](https://github.com/BartmanAbyss/WinUAE) with added register and memory write support. See the [patch details](https://github.com/axewater/WinUAE/blob/gdb-write-commands/HANDOVER.md).
+
+### 2. Install the MCP server
 
 ```bash
 git clone https://github.com/axewater/mcp-winuae-emu.git
@@ -22,33 +23,9 @@ npm install
 npm run build
 ```
 
-## Configuration
+### 3. Add to Claude Code
 
-The server is configured via environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `WINUAE_PATH` | `C:\apps\winuae` | Directory containing `winuae-gdb.exe` |
-| `WINUAE_CONFIG` | `<WINUAE_PATH>\Configurations\A500-Dev.uae` | Path to your `.uae` config file |
-| `WINUAE_GDB_PORT` | `2345` | GDB server TCP port |
-| `WINUAE_DEBUG` | `0` | Set to `1` to enable GDB protocol debug logging |
-
-### WinUAE config file
-
-Create a standard WinUAE `.uae` config file with your hardware settings (CPU, chipset, memory, ROM path, display, filesystem mounts, etc.). The server reads this file and generates a `default.uae` alongside `winuae-gdb.exe` at launch time, merging in the required GDB settings automatically.
-
-A minimal config needs at least:
-
-```ini
-cpu_type=68000
-chipset=ocs
-chipmem_size=1
-kickstart_rom_file=C:\path\to\kickstart.rom
-```
-
-### Adding to Claude Code
-
-Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or project `.mcp.json`):
+Add to your MCP settings (`~/.claude/claude_desktop_config.json` or project `.mcp.json`):
 
 ```json
 {
@@ -65,56 +42,78 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 }
 ```
 
+### 4. Provide a Kickstart ROM and config
+
+You need a valid Amiga Kickstart ROM file (e.g., Kickstart 1.3 for A500) and a WinUAE `.uae` config file. A minimal config:
+
+```ini
+cpu_type=68000
+chipset=ocs
+chipmem_size=1
+kickstart_rom_file=C:\path\to\kickstart.rom
+```
+
+The server reads your config, merges in GDB-required settings, and launches `winuae-gdb.exe` automatically.
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `WINUAE_PATH` | `C:\apps\winuae` | Directory containing `winuae-gdb.exe` |
+| `WINUAE_CONFIG` | `<WINUAE_PATH>\Configurations\A500-Dev.uae` | Path to your `.uae` config file |
+| `WINUAE_GDB_PORT` | `2345` | GDB server TCP port |
+| `WINUAE_DEBUG` | `0` | Set to `1` to enable GDB protocol debug logging |
+
 ## Tools
 
 ### Connection
 
 | Tool | Description |
 |---|---|
-| `winuae_connect` | Launch WinUAE and connect to GDB server. Tries an existing instance first, then launches if needed. |
-| `winuae_disconnect` | Disconnect and stop the emulator. |
-| `winuae_status` | Check if connected and responsive. |
+| `winuae_connect` | Launch WinUAE and connect to GDB server |
+| `winuae_disconnect` | Disconnect and stop the emulator |
+| `winuae_status` | Check if connected and responsive |
 
 ### Memory
 
 | Tool | Description |
 |---|---|
-| `winuae_memory_read` | Read memory bytes as hex. |
-| `winuae_memory_write` | Write hex bytes to memory. |
-| `winuae_memory_dump` | Hex + ASCII dump (like a hex editor). |
-| `winuae_load` | Load a binary file into Amiga memory. |
+| `winuae_memory_read` | Read memory bytes as hex |
+| `winuae_memory_write` | Write hex bytes to memory |
+| `winuae_memory_dump` | Hex + ASCII dump (like a hex editor) |
+| `winuae_load` | Load a binary file into Amiga memory |
 
 ### CPU
 
 | Tool | Description |
 |---|---|
-| `winuae_registers_get` | Read all m68k registers (D0-D7, A0-A7, SR, PC). |
-| `winuae_registers_set` | Write registers (any subset of D0-D7, A0-A7, SR, PC). |
-| `winuae_step` | Single-step N instructions. |
-| `winuae_continue` | Resume execution (fire-and-forget). Use `winuae_pause` to stop. |
-| `winuae_pause` | Pause execution. Returns registers and any pending stop reason. |
-| `winuae_reset` | Pause CPU and read current register state. |
+| `winuae_registers_get` | Read all m68k registers (D0-D7, A0-A7, SR, PC) |
+| `winuae_registers_set` | Write registers (any subset of D0-D7, A0-A7, SR, PC) |
+| `winuae_step` | Single-step N instructions |
+| `winuae_continue` | Resume execution |
+| `winuae_pause` | Pause execution and read registers |
+| `winuae_reset` | Pause CPU and read current register state |
 
 ### Breakpoints & Watchpoints
 
 | Tool | Description |
 |---|---|
-| `winuae_breakpoint_set` | Set a software breakpoint at an address. |
-| `winuae_breakpoint_clear` | Remove a breakpoint. |
-| `winuae_watchpoint_set` | Break on memory read/write/access. |
-| `winuae_watchpoint_clear` | Remove a watchpoint. |
+| `winuae_breakpoint_set` | Set a software breakpoint at an address |
+| `winuae_breakpoint_clear` | Remove a breakpoint |
+| `winuae_watchpoint_set` | Break on memory read/write/access |
+| `winuae_watchpoint_clear` | Remove a watchpoint |
 
 ### Amiga Hardware
 
 | Tool | Description |
 |---|---|
-| `winuae_custom_registers` | Read and decode all custom chip registers ($DFF000-$DFF1FE). |
-| `winuae_copper_disassemble` | Decode a Copper list (WAIT, MOVE, SKIP, END). |
-| `winuae_disassemble` | Basic m68k disassembly (raw words with known opcode decode). |
+| `winuae_custom_registers` | Read and decode all custom chip registers ($DFF000-$DFF1FE) |
+| `winuae_copper_disassemble` | Decode a Copper list (WAIT, MOVE, SKIP, END) |
+| `winuae_disassemble` | Basic m68k disassembly |
 
 ## How it works
 
-1. **Launch**: The server reads your `.uae` config, merges GDB-required settings, writes a `default.uae`, and spawns `winuae-gdb.exe -portable -G -s debugging_features=gdbserver -s debugging_trigger=`
+1. **Launch**: Reads your `.uae` config, merges GDB settings, spawns `winuae-gdb.exe -portable -G -s debugging_features=gdbserver -s debugging_trigger=`
 2. **Connect**: Retries TCP connection to `localhost:2345` until the GDB server is ready
 3. **Protocol**: Communicates via [GDB RSP](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Protocol.html) -- packet framing, checksums, ack mode, register/memory commands, breakpoint commands, etc.
 
@@ -125,6 +124,13 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 - Custom chip register reads use 64-byte chunks because the GDB server has read-size limits for hardware I/O addresses.
 - ECS/AGA-only registers ($DFF1C0+) return zeros on OCS chipset configurations.
 - CIA registers ($BFE001/$BFD000) are not accessible through the GDB memory read interface.
+
+## Credits
+
+- [WinUAE](https://www.winuae.net/) by Toni Wilen -- the Amiga emulator
+- [BartmanAbyss WinUAE fork](https://github.com/BartmanAbyss/WinUAE) -- added the GDB server to WinUAE
+- [vscode-amiga-debug](https://github.com/BartmanAbyss/vscode-amiga-debug) by BartmanAbyss -- the VSCode extension that pioneered Amiga GDB debugging, and the reference for this work
+- [Model Context Protocol](https://modelcontextprotocol.io/) by Anthropic
 
 ## Limitations
 
