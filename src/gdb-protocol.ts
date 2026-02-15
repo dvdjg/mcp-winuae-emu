@@ -320,14 +320,25 @@ export class GdbProtocol {
     return Buffer.from(reply, 'hex');
   }
 
+  /** Chunk size for memory writes to avoid overloading WinUAE GDB server (large M packets can crash). */
+  private static readonly WRITE_CHUNK = 4096;
+
   /**
-   * Write memory: sends 'M<addr>,<len>:<hex>'
+   * Write memory: sends 'M<addr>,<len>:<hex>' in chunks to avoid WinUAE crashes on large executables.
    */
   async writeMemory(addr: number, data: Buffer): Promise<void> {
-    const hex = data.toString('hex');
-    const reply = await this.sendCommand(`M${addr.toString(16)},${data.length.toString(16)}:${hex}`);
-    if (reply !== 'OK') {
-      throw new Error(`Memory write error at $${addr.toString(16)}: ${reply}`);
+    let offset = 0;
+    let currentAddr = addr;
+    while (offset < data.length) {
+      const chunkLen = Math.min(GdbProtocol.WRITE_CHUNK, data.length - offset);
+      const chunk = data.subarray(offset, offset + chunkLen);
+      const hex = chunk.toString('hex');
+      const reply = await this.sendCommand(`M${currentAddr.toString(16)},${chunkLen.toString(16)}:${hex}`);
+      if (reply !== 'OK') {
+        throw new Error(`Memory write error at $${currentAddr.toString(16)}: ${reply}`);
+      }
+      offset += chunkLen;
+      currentAddr += chunkLen;
     }
   }
 
@@ -382,13 +393,34 @@ export class GdbProtocol {
   /**
    * Continue execution: sends 'vCont;c', returns immediately (fire-and-forget).
    * The stop reply will arrive asynchronously when a breakpoint/watchpoint fires.
-   * Use pause() to stop execution, or check isRunning to see if already stopped.
+   * Call waitForStop() after continue() to block until the target stops (breakpoint hit).
    * Note: BartmanAbyss WinUAE only supports vCont commands, not basic 'c'.
    */
   async continue(): Promise<void> {
     this.pendingStopReply = null;
     this._isRunning = true;
     this.sendPacket('vCont;c');
+  }
+
+  /**
+   * Wait for the next stop reply (e.g. after continue(), when a breakpoint is hit).
+   * Use after continue() so execution actually stops at breakpoints.
+   */
+  async waitForStop(timeoutMs: number = 30000): Promise<string> {
+    if (this.pendingStopReply) {
+      const reply = this.pendingStopReply;
+      this.pendingStopReply = null;
+      this._isRunning = false;
+      return reply;
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.packetResolvers.findIndex(r => r.resolve === resolve);
+        if (idx >= 0) this.packetResolvers.splice(idx, 1);
+        reject(new Error('Wait for stop timeout (breakpoint not hit?)'));
+      }, timeoutMs);
+      this.packetResolvers.push({ resolve, reject, timer });
+    });
   }
 
   /**

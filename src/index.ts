@@ -266,6 +266,14 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'winuae_connect_existing',
+    description: 'Connect to an already-running WinUAE GDB server (port 2345). Do not start WinUAE. Use when WinUAE was started by F5 or by a script; then use breakpoints/memory/step without calling winuae_load.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
     name: 'winuae_disconnect',
     description: 'Disconnect from WinUAE and stop the emulator process',
     inputSchema: {
@@ -548,6 +556,20 @@ const tools: Tool[] = [
       properties: {},
     },
   },
+  {
+    name: 'winuae_wait_stop',
+    description: 'Wait for execution to stop (e.g. after winuae_continue, when a breakpoint is hit). Call this after winuae_continue so breakpoints actually stop the CPU. Returns stop reason and registers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeout_ms: {
+          type: 'number',
+          description: 'Max ms to wait (default 30000)',
+          default: 30000,
+        },
+      },
+    },
+  },
 
   // Amiga hardware tools
   {
@@ -612,6 +634,17 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         }
         const statusMsg = await connection.connectSmart();
         return { content: [{ type: 'text', text: statusMsg }] };
+      }
+
+      case 'winuae_connect_existing': {
+        if (connection?.connected) {
+          return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
+        }
+        if (!connection) {
+          connection = new WinUAEConnection(config);
+        }
+        await connection.connectExisting();
+        return { content: [{ type: 'text', text: `Connected to existing WinUAE GDB server on port ${config.gdbPort}. Do not call winuae_load (program already running).` }] };
       }
 
       case 'winuae_disconnect': {
@@ -843,7 +876,16 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const protocol = connection.getProtocol();
         await protocol.continue();
-        return { content: [{ type: 'text', text: 'Execution resumed. Use winuae_pause to stop.' }] };
+        return { content: [{ type: 'text', text: 'Execution resumed. Call winuae_wait_stop to wait for next breakpoint (or winuae_pause to interrupt).' }] };
+      }
+
+      case 'winuae_wait_stop': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const timeoutMs = args.timeout_ms ?? 30000;
+        const stopReply = await protocol.waitForStop(timeoutMs);
+        const regs = await protocol.readRegisters();
+        return { content: [{ type: 'text', text: `Stopped (${stopReply})\n${formatRegisters(regs)}` }] };
       }
 
       case 'winuae_pause': {
