@@ -288,10 +288,11 @@ export class GdbProtocol {
 
   /**
    * Write a single register by index: sends 'P<id>=<hex>'
+   * Uses a longer timeout — WinUAE GDB server responds slowly to register writes.
    */
   async writeRegister(id: number, value: number): Promise<void> {
     const hex = (value >>> 0).toString(16).padStart(8, '0');
-    const reply = await this.sendCommand(`P${id.toString(16)}=${hex}`);
+    const reply = await this.sendCommand(`P${id.toString(16)}=${hex}`, 30000);
     if (reply !== 'OK') throw new Error(`Register write failed for reg ${id}: ${reply}`);
   }
 
@@ -322,12 +323,55 @@ export class GdbProtocol {
 
   /**
    * Write memory: sends 'M<addr>,<len>:<hex>'
+   * Automatically chunks large writes to avoid GDB packet timeouts.
+   * Each chunk uses a generous timeout since the WinUAE GDB server
+   * processes writes slowly but reliably.
    */
   async writeMemory(addr: number, data: Buffer): Promise<void> {
-    const hex = data.toString('hex');
-    const reply = await this.sendCommand(`M${addr.toString(16)},${data.length.toString(16)}:${hex}`);
-    if (reply !== 'OK') {
-      throw new Error(`Memory write error at $${addr.toString(16)}: ${reply}`);
+    const CHUNK_SIZE = 256; // bytes per GDB M command
+    const WRITE_TIMEOUT = 30000; // 30s per chunk — WinUAE GDB is slow but works
+
+    if (data.length <= CHUNK_SIZE) {
+      const hex = data.toString('hex');
+      const reply = await this.sendCommand(
+        `M${addr.toString(16)},${data.length.toString(16)}:${hex}`,
+        WRITE_TIMEOUT
+      );
+      if (reply !== 'OK') {
+        throw new Error(`Memory write error at $${addr.toString(16)}: ${reply}`);
+      }
+      return;
+    }
+
+    // Chunked write for large payloads
+    for (let offset = 0; offset < data.length; offset += CHUNK_SIZE) {
+      const chunk = data.subarray(offset, Math.min(offset + CHUNK_SIZE, data.length));
+      const chunkAddr = addr + offset;
+      const hex = chunk.toString('hex');
+      const reply = await this.sendCommand(
+        `M${chunkAddr.toString(16)},${chunk.length.toString(16)}:${hex}`,
+        WRITE_TIMEOUT
+      );
+      if (reply !== 'OK') {
+        throw new Error(`Memory write error at $${chunkAddr.toString(16)} (offset ${offset}): ${reply}`);
+      }
+    }
+  }
+
+  /**
+   * Send a GDB monitor command (qRcmd). Used for custom WinUAE commands.
+   * Returns the response text, or throws on error.
+   */
+  async sendMonitorCommand(cmd: string): Promise<string> {
+    const hexCmd = Buffer.from(cmd, 'utf8').toString('hex');
+    const reply = await this.sendCommand(`qRcmd,${hexCmd}`, 30000);
+    if (reply === 'OK') return 'OK';
+    if (reply.startsWith('E')) throw new Error(`Monitor command '${cmd}' failed: ${reply}`);
+    // Response may be hex-encoded output
+    try {
+      return Buffer.from(reply, 'hex').toString('utf8');
+    } catch {
+      return reply;
     }
   }
 

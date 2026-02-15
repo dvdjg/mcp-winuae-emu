@@ -285,7 +285,7 @@ const tools: Tool[] = [
   // Load/Reset
   {
     name: 'winuae_load',
-    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary.',
+    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary. For disk images (.adf etc.), inserts into DF0: and restarts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -293,13 +293,18 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Path to Amiga executable on host filesystem',
         },
+        address: {
+          type: ['string', 'number'],
+          description: 'Load address in Amiga memory (default: $4000). Use $ prefix for hex.',
+          default: 0x4000,
+        },
       },
       required: ['file'],
     },
   },
   {
     name: 'winuae_reset',
-    description: 'Pause the Amiga CPU and read current register state.',
+    description: 'Reset the Amiga by restarting WinUAE with current configuration (hard reset). Reconnects GDB automatically.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -579,7 +584,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_disassemble',
-    description: 'Read memory and show as raw 68k words. Note: basic decode only — shows known opcodes (RTS, NOP, etc.) and raw DC.W for others.',
+    description: 'Disassemble 68k machine code at given address using WinUAE\'s built-in disassembler. Shows address, hex bytes, and full mnemonic with operands.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -594,6 +599,19 @@ const tools: Tool[] = [
         },
       },
       required: ['address'],
+    },
+  },
+  {
+    name: 'winuae_screenshot',
+    description: 'Capture current screen buffer and save as PNG file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filename: {
+          type: 'string',
+          description: 'Output filename (default: winuae-screen-{timestamp}.png)',
+        },
+      },
     },
   },
 ];
@@ -655,12 +673,15 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           }
         }
 
-        // Original behavior: load binary into memory via GDB
+        // Load binary into memory via GDB (chunked writes)
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const fileData = readFileSync(absPath);
         const protocol = connection.getProtocol();
 
-        let loadAddr = 0x40000;
+        const loadAddr = args.address !== undefined
+          ? parseHexOrDecimal(args.address)
+          : 0x4000;
+
         if (fileData.length >= 4) {
           const magic = fileData.readUInt32BE(0);
           if (magic === 0x000003F3) {
@@ -668,22 +689,33 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           }
         }
 
+        console.error(`[WinUAE] Loading ${fileData.length} bytes to ${hex32(loadAddr)} (chunked)...`);
         await protocol.writeMemory(loadAddr, fileData);
-        return { content: [{ type: 'text', text: `Loaded ${fileData.length} bytes from ${absPath} at ${hex32(loadAddr)}` }] };
+
+        // Verify first 16 bytes to confirm write succeeded
+        const verifyLen = Math.min(16, fileData.length);
+        const readBack = await protocol.readMemory(loadAddr, verifyLen);
+        const match = readBack.equals(fileData.subarray(0, verifyLen));
+        const verifyMsg = match
+          ? 'Verify OK (first 16 bytes match)'
+          : `VERIFY MISMATCH! Expected: ${fileData.subarray(0, verifyLen).toString('hex')} Got: ${readBack.toString('hex')}`;
+
+        return { content: [{ type: 'text', text: `Loaded ${fileData.length} bytes from ${absPath} at ${hex32(loadAddr)}\n${verifyMsg}` }] };
       }
 
       case 'winuae_reset': {
-        if (!connection?.connected) throw new Error('Not connected to WinUAE');
-        // GDB RSP doesn't have a direct reset command
-        // We can try to pause and get registers
-        const protocol = connection.getProtocol();
+        if (!connection) throw new Error('Not connected to WinUAE');
+        // Restart WinUAE entirely — this is a hard reset (power cycle)
+        const statusMsg = await connection.restart();
+        // After restart, pause and read registers
+        const resetProtocol = connection.getProtocol();
         try {
-          await protocol.pause();
+          await resetProtocol.pause();
         } catch {
-          // May already be paused
+          // May already be paused after fresh connect
         }
-        const regs = await protocol.readRegisters();
-        return { content: [{ type: 'text', text: `CPU paused\n${formatRegisters(regs)}` }] };
+        const regs = await resetProtocol.readRegisters();
+        return { content: [{ type: 'text', text: `Reset complete. ${statusMsg}\n${formatRegisters(regs)}` }] };
       }
 
       case 'winuae_insert_disk': {
@@ -774,22 +806,34 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           SR: 16, PC: 17,
         };
 
-        const written: string[] = [];
+        const toWrite: Array<{ name: string; idx: number; value: number }> = [];
         for (const [regName, rawValue] of Object.entries(args)) {
           if (rawValue === undefined || rawValue === null) continue;
           const idx = REG_INDEX[regName];
           if (idx === undefined) continue;
-          const value = parseHexOrDecimal(rawValue as string | number);
-          await protocol.writeRegister(idx, value);
-          written.push(`${regName}=${hex32(value)}`);
+          toWrite.push({ name: regName, idx, value: parseHexOrDecimal(rawValue as string | number) });
         }
 
-        if (written.length === 0) {
+        if (toWrite.length === 0) {
           return { content: [{ type: 'text', text: 'No registers specified to write' }] };
         }
 
+        // Write one register at a time, verify each before proceeding.
+        // The WinUAE GDB server needs time between register writes.
+        const results: string[] = [];
+        for (const { name, idx, value } of toWrite) {
+          await protocol.writeRegister(idx, value);
+          // Read back to verify and to drain the GDB server state
+          const actual = await protocol.readRegister(idx);
+          if (actual !== (value >>> 0)) {
+            results.push(`${name}=${hex32(value)} (VERIFY FAILED: got ${hex32(actual)})`);
+          } else {
+            results.push(`${name}=${hex32(value)}`);
+          }
+        }
+
         const regs = await protocol.readRegisters();
-        return { content: [{ type: 'text', text: `Set ${written.join(', ')}\n${formatRegisters(regs)}` }] };
+        return { content: [{ type: 'text', text: `Set ${results.join(', ')}\n${formatRegisters(regs)}` }] };
       }
 
       case 'winuae_breakpoint_set': {
@@ -894,10 +938,31 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const addr = parseHexOrDecimal(args.address);
         const count = args.count || 20;
         const protocol = connection.getProtocol();
-        // Read enough bytes (worst case: 10 bytes per instruction for m68k)
-        const data = await protocol.readMemory(addr, count * 2);
-        const disasm = disassembleM68k(data, addr, count);
-        return { content: [{ type: 'text', text: disasm }] };
+        // Use WinUAE's built-in 68k disassembler via monitor command
+        const result = await protocol.sendMonitorCommand(`disasm ${addr.toString(16)} ${count}`);
+        return { content: [{ type: 'text', text: result }] };
+      }
+
+      case 'winuae_screenshot': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        const filename = args.filename || `winuae-screen-${timestamp}.png`;
+        // Resolve to absolute path using temp dir if relative
+        const fs = await import('fs');
+        const os = await import('os');
+        let filepath = filename;
+        if (!path.isAbsolute(filepath)) {
+          filepath = path.join(os.tmpdir(), filepath);
+        }
+        // Use Windows backslash path for the WinUAE side
+        const winPath = filepath.replace(/\//g, '\\');
+        const result = await protocol.sendMonitorCommand(`screenshot ${winPath}`);
+        if (result.startsWith('OK')) {
+          // result format: "OK WxH filepath"
+          return { content: [{ type: 'text', text: `Screenshot saved: ${result}\nFile: ${filepath}` }] };
+        }
+        throw new Error(`Screenshot failed: ${result}`);
       }
 
       default:
