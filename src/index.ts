@@ -904,8 +904,14 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         connection.setFloppy(drive, absPath);
 
         if (connection.connected) {
-          const statusMsg = await connection.restart();
-          return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: and restarted.\n${statusMsg}` }] };
+          const protocol = connection.getProtocol();
+          try {
+            await protocol.sendMonitorCommand(`df${drive} insert ${absPath}`, 15000);
+            return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: (hot-swap, no restart).` }] };
+          } catch {
+            const statusMsg = await connection.restart();
+            return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: and restarted.\n${statusMsg}` }] };
+          }
         } else {
           return { content: [{ type: 'text', text: `Disk ${absPath} set for DF${drive}:. Will be mounted on next winuae_connect.` }] };
         }
@@ -921,8 +927,14 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         connection.setFloppy(drive, null);
 
         if (connection.connected) {
-          const statusMsg = await connection.restart();
-          return { content: [{ type: 'text', text: `Ejected DF${drive}: and restarted.\n${statusMsg}` }] };
+          const protocol = connection.getProtocol();
+          try {
+            await protocol.sendMonitorCommand(`df${drive} eject`, 5000);
+            return { content: [{ type: 'text', text: `Ejected DF${drive}: (hot-swap, no restart).` }] };
+          } catch {
+            const statusMsg = await connection.restart();
+            return { content: [{ type: 'text', text: `Ejected DF${drive}: and restarted.\n${statusMsg}` }] };
+          }
         } else {
           return { content: [{ type: 'text', text: `DF${drive}: cleared. Will take effect on next winuae_connect.` }] };
         }
