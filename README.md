@@ -128,6 +128,7 @@ The server reads your config, merges in GDB-required settings, and launches `win
 |---|---|
 | `winuae_screenshot` | Capture emulator display to PNG file (host path). Uses GDB monitor `screenshot`. |
 | `winuae_run_program` | Load binary into memory, set PC, and start execution. For testing executables. |
+| `winuae_profile` | Run frame profiler for N frames; writes binary with CPU samples, DMA per scanline (CRT/blitter), custom regs, screenshots. Same format as [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame/Graphics profiler. |
 | `winuae_input_key` | Simulate Amiga keyboard: raw scancode press/release (e.g. 0x45=Return). |
 | `winuae_input_event` | Send raw WinUAE input event (event ID from config). Precise control. |
 
@@ -148,7 +149,11 @@ When using WinUAE-DBG or Bartman fork with monitor support, the MCP server can s
 | `input key <scancode> <1\|0>` | Simulate Amiga keyboard (scancode 0x00-0x7F, 1=press 0=release) |
 | `input event <event_id> [state]` | Send raw input event (state 1/0/2) |
 | `reset` | Restore savestate at process entry (when debugging_trigger set) |
-| `profile <n> <unwind> <out>` | CPU profiling (advanced) |
+| `profile <n> <unwind> <out>` | Frame profiler: N frames, optional unwind table, output file. Produces same data as vscode-amiga-debug (DMA per scanline, blitter, CRT flow, screenshots). |
+
+### Frame profiling
+
+The `winuae_profile` tool runs WinUAE’s monitor command `profile` and writes a binary file that contains the same exhaustive data as the [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame Profiler and Graphics Debugger: CPU samples, DMA records per scanline (CRT beam position, blitter, bitplanes, sprites), custom chip registers, AGA colors, blitter resources, and a screenshot per frame. You can open the file in the extension’s profiler UI or parse it for autonomous analysis (e.g. from an MCP client).
 
 ### Technical notes
 

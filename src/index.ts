@@ -293,7 +293,7 @@ const tools: Tool[] = [
   // Load/Reset
   {
     name: 'winuae_load',
-    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary. For disk images (.adf, .zip etc.), inserts into DF0: and restarts. ZIP files are opened by WinUAE; it uses the first disk image inside.',
+    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary. For disk images (ADF, ZIP, ADZ, DMS, IPF), inserts into DF0: and restarts. ADF is the native Amiga disk image format; ZIP files are opened by WinUAE and the first disk image inside is used.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -322,13 +322,13 @@ const tools: Tool[] = [
   // Disk tools
   {
     name: 'winuae_insert_disk',
-    description: 'Insert a floppy disk image (ADF, ADZ, DMS, IPF, ZIP) into a drive. Restarts WinUAE to apply. ZIP files: WinUAE extracts the first disk image. Use drive 0 for DF0: (boot drive).',
+    description: 'Insert a floppy disk image (ADF Amiga Disk File, ADZ, DMS, IPF, ZIP) into a drive. ADF is the standard Amiga format. ZIP: WinUAE uses the first image inside. Use drive 0 for DF0: (boot drive).',
     inputSchema: {
       type: 'object',
       properties: {
         file: {
           type: 'string',
-          description: 'Path to disk image file (.adf, .adz, .dms, .ipf, .zip)',
+          description: 'Path to disk image file (e.g. .adf Amiga Disk File, .zip, .adz, .dms, .ipf)',
         },
         drive: {
           type: 'number',
@@ -349,6 +349,29 @@ const tools: Tool[] = [
           type: 'number',
           description: 'Drive number 0-3 (default: 0 = DF0:)',
           default: 0,
+        },
+      },
+    },
+  },
+
+  {
+    name: 'winuae_profile',
+    description: 'Run frame profiler (same as vscode-amiga-debug): captures N frames of CPU samples, DMA per scanline, custom chip registers, blitter resources, and screenshot per frame. Output is a binary file compatible with vscode-amiga-debug Graphics Debugger / Frame Profiler. Use to analyze CRT scanline flow, blitter ops, and CPU usage autonomously.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        num_frames: {
+          type: 'number',
+          description: 'Number of frames to capture (1-100, default 1)',
+          default: 1,
+        },
+        out_file: {
+          type: 'string',
+          description: 'Host path for the profile output file (binary). Default: temp dir with timestamp.',
+        },
+        unwind_file: {
+          type: 'string',
+          description: 'Optional path to unwind table for symbol resolution (from linked ELF). Leave empty if not needed.',
         },
       },
     },
@@ -938,6 +961,40 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         } else {
           return { content: [{ type: 'text', text: `DF${drive}: cleared. Will take effect on next winuae_connect.` }] };
         }
+      }
+
+      case 'winuae_profile': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const numFrames = Math.max(1, Math.min(100, args.num_frames ?? 1));
+        const os = await import('os');
+        const { resolve } = await import('path');
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        const outFile = args.out_file
+          ? resolve(args.out_file)
+          : resolve(os.tmpdir(), `winuae-profile-${timestamp}.bin`);
+        const unwindFile = args.unwind_file ? resolve(args.unwind_file) : '';
+        const protocol = connection.getProtocol();
+        const cmd = unwindFile
+          ? `profile ${numFrames} "${unwindFile}" "${outFile}"`
+          : `profile ${numFrames} "" "${outFile}"`;
+        const timeoutMs = 60000 + numFrames * 3000;
+        const reply = await protocol.sendMonitorCommand(cmd, timeoutMs);
+        let decoded: string;
+        try {
+          if (/^[0-9a-fA-F]+$/.test(reply) && reply.length % 2 === 0) {
+            decoded = Buffer.from(reply, 'hex').toString('utf8');
+          } else {
+            decoded = reply;
+          }
+        } catch {
+          decoded = reply;
+        }
+        const summary = [
+          `Profile: ${numFrames} frame(s) written to: ${outFile}`,
+          'Content (same format as vscode-amiga-debug): CPU samples, DMA records per scanline (CRT flow), custom chip registers, AGA colors, blitter/bitmap resources, screenshot per frame (PNG/JPG).',
+          'Open the file in vscode-amiga-debug Frame Profiler / Graphics Debugger, or parse the binary format for autonomous analysis.',
+        ].join('\n');
+        return { content: [{ type: 'text', text: `${decoded}\n${summary}` }] };
       }
 
       case 'winuae_memory_read': {
