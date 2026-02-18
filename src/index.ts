@@ -676,6 +676,52 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'winuae_input_joy',
+    description: 'Simulate joystick/gamepad: port 0 or 1, direction/button (left, right, up, down, fire, 2nd, 3rd), state 1=press 0=release.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        port: {
+          type: 'number',
+          description: 'Joystick port: 0=port 1, 1=port 2',
+          default: 0,
+        },
+        action: {
+          type: 'string',
+          description: 'Direction or button: left, right, up, down, fire, 2nd, 3rd',
+          enum: ['left', 'right', 'up', 'down', 'fire', '2nd', '3rd'],
+        },
+        state: {
+          type: 'number',
+          description: '1=press, 0=release (default 1)',
+          default: 1,
+        },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_input_mouse',
+    description: 'Simulate mouse: move (dx, dy relative), abs (x, y absolute), or button (0=left 1=right 2=middle, 1|0 press|release).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          description: 'move=relative delta, abs=absolute position, button=button press/release',
+          enum: ['move', 'abs', 'button'],
+        },
+        dx: { type: 'number', description: 'Delta X for mode=move' },
+        dy: { type: 'number', description: 'Delta Y for mode=move' },
+        x: { type: 'number', description: 'Absolute X for mode=abs' },
+        y: { type: 'number', description: 'Absolute Y for mode=abs' },
+        button: { type: 'number', description: '0=left 1=right 2=middle for mode=button' },
+        state: { type: 'number', description: '1=press 0=release for mode=button', default: 1 },
+      },
+      required: ['mode'],
+    },
+  },
+  {
     name: 'winuae_run_program',
     description: 'Load an Amiga executable into memory, set PC to entry, and start execution.',
     inputSchema: {
@@ -1142,6 +1188,35 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const protocol = connection.getProtocol();
         await protocol.sendMonitorCommand(`input event ${evt} ${st}`, 5000);
         return { content: [{ type: 'text', text: `Sent input event ${evt} state ${st}` }] };
+      }
+
+      case 'winuae_input_joy': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { port = 0, action, state = 1 } = args;
+        const st = state ? 1 : 0;
+        const protocol = connection.getProtocol();
+        await protocol.sendMonitorCommand(`input joy ${port} ${action} ${st}`, 5000);
+        return { content: [{ type: 'text', text: `Sent joy port ${port} ${action} ${st ? 'press' : 'release'}` }] };
+      }
+
+      case 'winuae_input_mouse': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { mode, dx = 0, dy = 0, x = 0, y = 0, button = 0, state = 1 } = args;
+        const protocol = connection.getProtocol();
+        if (mode === 'move') {
+          await protocol.sendMonitorCommand(`input mouse move ${dx} ${dy}`, 5000);
+          return { content: [{ type: 'text', text: `Mouse move dx=${dx} dy=${dy}` }] };
+        }
+        if (mode === 'abs') {
+          await protocol.sendMonitorCommand(`input mouse abs ${x} ${y}`, 5000);
+          return { content: [{ type: 'text', text: `Mouse abs x=${x} y=${y}` }] };
+        }
+        if (mode === 'button') {
+          const st = state ? 1 : 0;
+          await protocol.sendMonitorCommand(`input mouse button ${button} ${st}`, 5000);
+          return { content: [{ type: 'text', text: `Mouse button ${button} ${st ? 'press' : 'release'}` }] };
+        }
+        throw new Error(`Invalid mode: ${mode}`);
       }
 
       default:
