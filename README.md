@@ -113,17 +113,15 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_watchpoint_set` | Break on memory read/write/access |
 | `winuae_watchpoint_clear` | Remove a watchpoint |
 
-### Amiga Hardware
+### Amiga Hardware (core tools)
 
 | Tool | Description |
 |---|---|
-| `winuae_custom_registers` | Read and decode all custom chip registers ($DFF000-$DFF1FE) |
-| `winuae_copper_disassemble` | Decode a Copper list (WAIT, MOVE, SKIP, END) |
-| `winuae_gfx_state` | Display state: BPLCON0, bitplane/sprite pointers, DIW/DDF, DMACON, palette. For graphics extraction. |
-| `winuae_audio_state` | Paula state: AUD0–3 sample ptr, length, period, volume; optional raw sample hex dump. |
-| `winuae_bitmap_read` | Read raw bitplane data from chip RAM (address, row_bytes, height, num_planes). |
-| `winuae_memory_search` | Search RAM for hex pattern (e.g. Copper, graphics). Returns first match offset. |
-| `winuae_custom_write` | Write 16-bit to custom register by name (BPLCON0, DMACON, etc.). Toggle bitplanes/sprites. |
+| `winuae_custom_registers` | Read all $DFF000–$DFF1FE with names. Use to get BPL/AUD/DMACON/DIW/DDF/COLOR/SPR/COP1; derive bitmap and sample addresses, then use memory_read to dump. |
+| `winuae_copper_disassemble` | Decode Copper list at address (e.g. COP1LCH/L from custom_registers). |
+| `winuae_memory_read` | Read any address/length (hex). Use for bitplane dumps, sample dumps, or chunked pattern search. |
+| `winuae_memory_write` | Write hex to any address. Use $DFF100 (BPLCON0) or $DFF096 (DMACON) with 2-byte big-endian to toggle bitplanes/sprites. |
+| `winuae_memory_dump` | Hex+ASCII dump; inspect regions or search in output. |
 | `winuae_disassemble` | Basic m68k disassembly (raw words) |
 | `winuae_disassemble_full` | Full m68k disassembly via WinUAE sm68k (requires monitor command support) |
 
@@ -160,9 +158,15 @@ When using WinUAE-DBG or Bartman fork with monitor support, the MCP server can s
 
 The `winuae_profile` tool runs WinUAE’s monitor command `profile` and writes a binary file that contains the same exhaustive data as the [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame Profiler and Graphics Debugger: CPU samples, DMA records per scanline (CRT beam position, blitter, bitplanes, sprites), custom chip registers, AGA colors, blitter resources, and a screenshot per frame. You can open the file in the extension’s profiler UI or parse it for autonomous analysis (e.g. from an MCP client).
 
-### Graphics, audio, and low-level analysis
+### What you can do with the core tools (for the AI)
 
-To **extract graphics and sound** from a running game or binary: use `winuae_gfx_state` to read the current display setup (bitplane pointers, dimensions, palette), then `winuae_bitmap_read` to dump raw bitplane data from chip RAM, or `winuae_audio_state` (with `samples_hex: true`) to get Paula channel state and raw sample data. To **inspect behavior** (e.g. [coppenheimer](https://github.com/losso3000/coppenheimer)-style): use `winuae_custom_write` to set BPLCON0 or DMACON and toggle bitplanes or sprites on/off; use `winuae_memory_search` to find Copper lists or patterns in memory. Together with `winuae_custom_registers`, `winuae_copper_disassemble`, and the frame profiler, you can get a low-level description of mechanics, timings, and assets for autonomous analysis.
+There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “memory_search”, or “custom_write” tools. Use the **core** tools as follows:
+
+- **Graphics extraction**: Call `winuae_custom_registers`; from the output read BPL1PTH/L (offsets 0xE0/0xE2; 24-bit address = high byte of PTH << 16 | PTL), BPLCON0 (0x100; low 3 bits = num bitplanes), DIW/DDF (0x8E–0x94) to compute row_bytes and height. Then call `winuae_memory_read` with that address and length (row_bytes × height × num_planes) to get raw planar data; decode to image externally.
+- **Sound extraction**: From `winuae_custom_registers`, read AUD0–3 LCH/LCL (0xA0–0xD2) for 24-bit sample address and LEN (words). Call `winuae_memory_read` at that address with length LEN×2 bytes to get raw 8-bit samples.
+- **Toggle bitplanes or sprites** ([coppenheimer](https://github.com/losso3000/coppenheimer)-style): Use `winuae_memory_write` with address $DFF096 (DMACON; clear bit 9 to disable sprites, bit 8 to disable bitplanes) or $DFF100 (BPLCON0) and 2-byte hex value (big-endian, e.g. `0200`).
+- **Search memory for a pattern**: Call `winuae_memory_read` in chunks (e.g. 4096 bytes) over the range, then check the returned hex for your pattern; or use `winuae_memory_dump` and search in the text output.
+- **Copper list**: Get COP1LCH/L from custom_registers (0x80/0x82), then `winuae_copper_disassemble` at that address.
 
 ### Technical notes
 
