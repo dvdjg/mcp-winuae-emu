@@ -253,6 +253,26 @@ function isDiskImage(filePath: string): boolean {
   return DISK_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
+/** Base address of Amiga custom chips */
+const CUSTOM_BASE = 0xDFF000;
+
+/** Read 16-bit big-endian word from custom regs buffer at offset (0-0x1FE) */
+function readCustomWord(data: Buffer, offset: number): number {
+  return data.readUInt16BE(offset);
+}
+
+/** Build 24-bit chip RAM address from high and low 16-bit register pair (PTH: bits 7-0, PTL: full 16) */
+function chipAddr(high: number, low: number): number {
+  return ((high & 0xFF) << 16) | (low & 0xFFFF);
+}
+
+/** Custom register name to offset (from $DFF000). Used by winuae_custom_write. */
+const CUSTOM_REG_OFFSET: Record<string, number> = {};
+for (const [offStr, name] of Object.entries(CUSTOM_REGS)) {
+  const off = parseInt(offStr, 10);
+  if (!Number.isNaN(off)) CUSTOM_REG_OFFSET[name] = off;
+}
+
 // ─── Tool Definitions ────────────────────────────────────────────────
 
 const tools: Tool[] = [
@@ -341,7 +361,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_eject_disk',
-    description: 'Eject floppy disk from a drive. Restarts WinUAE to apply.',
+    description: 'Eject floppy disk from a drive. When connected, uses monitor command (hot-swap, no restart); otherwise clears the drive for next winuae_connect.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -625,6 +645,96 @@ const tools: Tool[] = [
         },
       },
       required: ['address'],
+    },
+  },
+  {
+    name: 'winuae_gfx_state',
+    description: 'Read current Amiga display state from custom registers: BPLCON0 (bitplanes, HIRES), bitplane and sprite pointers, DIW/DDF window, DMACON, color registers, Copper pointer. Use to extract graphics: get bitmap addresses and dimensions, then use winuae_bitmap_read or winuae_memory_read to dump chip RAM.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'winuae_audio_state',
+    description: 'Read Paula audio state: for each of 4 channels, sample pointer (AUDxLC), length, period, volume. Optionally include raw sample data from chip RAM (samples_hex=true) for extraction.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        samples_hex: {
+          type: 'boolean',
+          description: 'If true, read sample data from chip RAM for each channel and return as hex (can be large). Default false.',
+          default: false,
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_bitmap_read',
+    description: 'Read raw bitplane data from chip RAM. Give start address (e.g. from winuae_gfx_state BPL1PT), row_bytes (bytes per row per plane), height in rows, and num_planes (1-6). Returns hex of planar data; decode to image externally (e.g. Amiga planar to chunky).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Chip RAM start address of first bitplane (e.g. from BPL1PTH/L)',
+        },
+        row_bytes: {
+          type: 'number',
+          description: 'Bytes per row per bitplane (e.g. 40 for 320px 1bpl)',
+        },
+        height: {
+          type: 'number',
+          description: 'Number of rows',
+        },
+        num_planes: {
+          type: 'number',
+          description: 'Number of bitplanes (1-6). Total bytes = row_bytes * height * num_planes.',
+          default: 1,
+        },
+      },
+      required: ['address', 'row_bytes', 'height'],
+    },
+  },
+  {
+    name: 'winuae_memory_search',
+    description: 'Search chip or fast RAM for a hex byte pattern (e.g. find Copper lists, graphics, or code signatures). Returns first offset where pattern is found, or -1. Pattern: hex string without spaces (e.g. "01FE0000").',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Start address to search (e.g. $0 or $40000)',
+        },
+        length: {
+          type: 'number',
+          description: 'Number of bytes to search (default 65536). Keep under 256K to avoid timeouts.',
+          default: 65536,
+        },
+        pattern: {
+          type: 'string',
+          description: 'Hex pattern to find (e.g. 01FE0000 for Copper WAIT). No spaces.',
+        },
+      },
+      required: ['address', 'pattern'],
+    },
+  },
+  {
+    name: 'winuae_custom_write',
+    description: 'Write a 16-bit value to an Amiga custom register. Use to toggle bitplanes (BPLCON0), DMA (DMACON), or other hardware state for debugging (e.g. disable sprites, hide bitplanes like coppenheimer). Register by name (e.g. BPLCON0, DMACON) or by offset from $DFF000 (e.g. 0x100).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        register: {
+          type: 'string',
+          description: 'Register name (e.g. BPLCON0, DMACON) or hex offset (e.g. 0x100 for BPLCON0)',
+        },
+        value: {
+          type: ['string', 'number'],
+          description: '16-bit value to write (decimal or hex with 0x/$)',
+        },
+      },
+      required: ['register', 'value'],
     },
   },
   {
@@ -1186,6 +1296,149 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const data = await protocol.readMemory(addr, length);
         const decoded = decodeCopperList(data, addr);
         return { content: [{ type: 'text', text: `Copper list at ${hex32(addr)}:\n${decoded}` }] };
+      }
+
+      case 'winuae_gfx_state': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const chunks: Buffer[] = [];
+        for (let off = 0; off < 0x200; off += 0x40) {
+          try {
+            chunks.push(await protocol.readMemory(CUSTOM_BASE + off, 0x40));
+          } catch {
+            chunks.push(Buffer.alloc(0x40, 0));
+          }
+        }
+        const d = Buffer.concat(chunks);
+        const u16 = (o: number) => readCustomWord(d, o);
+        const bplcon0 = u16(0x100);
+        const bp = bplcon0 & 7;
+        const numPlanes = bp === 0 ? 1 : bp;
+        const hires = (bplcon0 & 0x8000) !== 0;
+        const ham = (bplcon0 & 0x0800) !== 0;
+        const dualPlayfield = (bplcon0 & 0x0400) !== 0;
+        const lines: string[] = [
+          'Display state (custom registers):',
+          `  BPLCON0=${hex16(bplcon0)}  bitplanes=${numPlanes}  HIRES=${hires}  HAM=${ham}  dual PF=${dualPlayfield}`,
+          `  DMACON=${hex16(u16(0x096))}  (bit9=sprites bit8=bitplanes bit10=blitter ...)`,
+          `  DIWSTRT=${hex16(u16(0x08E))}  DIWSTOP=${hex16(u16(0x090))}  DDFSTRT=${hex16(u16(0x092))}  DDFSTOP=${hex16(u16(0x094))}`,
+          '  Bitplane pointers (chip RAM):',
+        ];
+        for (let i = 1; i <= 6; i++) {
+          const addr = chipAddr(u16(0xE0 + (i - 1) * 4), u16(0xE2 + (i - 1) * 4));
+          lines.push(`    BPL${i}PTH/L = ${hex32(addr)}`);
+        }
+        lines.push('  Sprite pointers (chip RAM):');
+        for (let i = 0; i < 8; i++) {
+          const addr = chipAddr(u16(0x120 + i * 4), u16(0x122 + i * 4));
+          lines.push(`    SPR${i}PTH/L = ${hex32(addr)}`);
+        }
+        lines.push(`  COP1LCH/L = ${hex32(chipAddr(u16(0x080), u16(0x082)))}  (Copper list 1)`);
+        lines.push(`  BPL1MOD=${u16(0x108)}  BPL2MOD=${u16(0x10A)}`);
+        lines.push('  COLOR00-31 (palette):');
+        for (let i = 0; i < 32; i += 8) {
+          const vals = Array.from({ length: 8 }, (_, j) => hex16(u16(0x180 + (i + j) * 2)));
+          lines.push(`    ${vals.join(' ')}`);
+        }
+        lines.push('Use winuae_bitmap_read with BPL1 address and row_bytes/height from DIW/DDF to dump bitmap. Use winuae_custom_write BPLCON0/DMACON to toggle bitplanes/sprites.');
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      case 'winuae_audio_state': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const chunks: Buffer[] = [];
+        for (let off = 0; off < 0x200; off += 0x40) {
+          try {
+            chunks.push(await protocol.readMemory(CUSTOM_BASE + off, 0x40));
+          } catch {
+            chunks.push(Buffer.alloc(0x40, 0));
+          }
+        }
+        const d = Buffer.concat(chunks);
+        const u16 = (o: number) => readCustomWord(d, o);
+        const includeSamples = args.samples_hex === true;
+        const lines: string[] = ['Paula audio state (AUD0-AUD3):'];
+        for (let ch = 0; ch < 4; ch++) {
+          const base = 0xA0 + ch * 0x10;
+          const lc = chipAddr(u16(base), u16(base + 2));
+          const len = u16(base + 4);
+          const per = u16(base + 6);
+          const vol = u16(base + 8) & 0x7F;
+          lines.push(`  AUD${ch}: LC=${hex32(lc)} LEN=${len} PER=${per} VOL=${vol}`);
+          if (includeSamples && lc !== 0 && len > 0) {
+            const bytes = Math.min(len * 2, 8192);
+            try {
+              const samp = await protocol.readMemory(lc, bytes);
+              lines.push(`    samples_hex(${bytes} bytes): ${samp.toString('hex').slice(0, 512)}${bytes > 256 ? '...' : ''}`);
+            } catch {
+              lines.push('    (read failed)');
+            }
+          }
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      case 'winuae_bitmap_read': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const addr = parseHexOrDecimal(args.address);
+        const rowBytes = Number(args.row_bytes);
+        const height = Number(args.height);
+        const numPlanes = Math.max(1, Math.min(6, Number(args.num_planes) || 1));
+        if (rowBytes <= 0 || height <= 0) throw new Error('row_bytes and height must be positive');
+        const bytesPerPlane = rowBytes * height;
+        const totalBytes = bytesPerPlane * numPlanes;
+        if (totalBytes > 256 * 1024) throw new Error('Total bytes too large (max 256KB)');
+        const protocol = connection.getProtocol();
+        const data = await protocol.readMemory(addr, totalBytes);
+        const hex = data.toString('hex');
+        const summary = `Read ${totalBytes} bytes planar bitmap at ${hex32(addr)}: ${rowBytes} row_bytes × ${height} rows × ${numPlanes} planes. Decode planar→chunky externally.`;
+        return { content: [{ type: 'text', text: `${summary}\nhex: ${hex.slice(0, 2048)}${hex.length > 2048 ? '...' : ''}` }] };
+      }
+
+      case 'winuae_memory_search': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const startAddr = parseHexOrDecimal(args.address);
+        const maxLen = Math.min(Number(args.length) || 65536, 256 * 1024);
+        const patternStr = String(args.pattern).replace(/\s/g, '');
+        if (patternStr.length % 2 !== 0) throw new Error('Pattern must have even number of hex digits');
+        const pattern = Buffer.from(patternStr, 'hex');
+        if (pattern.length === 0) throw new Error('Pattern cannot be empty');
+        const protocol = connection.getProtocol();
+        const chunkSize = 4096;
+        let found = -1;
+        for (let off = 0; off < maxLen && found < 0; off += chunkSize) {
+          const len = Math.min(chunkSize + pattern.length - 1, maxLen - off);
+          const chunk = await protocol.readMemory(startAddr + off, len);
+          const idx = chunk.indexOf(pattern);
+          if (idx >= 0) {
+            found = off + idx;
+            break;
+          }
+        }
+        const result = found >= 0 ? `Found at offset ${found} (address ${hex32(startAddr + found)})` : 'Pattern not found';
+        return { content: [{ type: 'text', text: result }] };
+      }
+
+      case 'winuae_custom_write': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const regStr = String(args.register).toUpperCase();
+        const value = parseHexOrDecimal(args.value);
+        const val16 = value & 0xFFFF;
+        let offset: number;
+        if (CUSTOM_REG_OFFSET[regStr] !== undefined) {
+          offset = CUSTOM_REG_OFFSET[regStr];
+        } else {
+          const parsed = parseHexOrDecimal(regStr);
+          if (parsed >= 0 && parsed <= 0x1FE) offset = parsed;
+          else throw new Error(`Unknown register: ${args.register}. Use name (e.g. BPLCON0) or offset (e.g. 0x100).`);
+        }
+        const protocol = connection.getProtocol();
+        const buf = Buffer.alloc(2);
+        buf.writeUInt16BE(val16, 0);
+        await protocol.writeMemory(CUSTOM_BASE + offset, buf);
+        const name = CUSTOM_REGS[offset] ?? `$DFF${offset.toString(16)}`;
+        return { content: [{ type: 'text', text: `Wrote ${hex16(val16)} to ${name} (${hex32(CUSTOM_BASE + offset)})` }] };
       }
 
       case 'winuae_disassemble': {

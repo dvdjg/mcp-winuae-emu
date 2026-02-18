@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /**
- * Load a disk image (ADF, ZIP, etc.) into DF0: and launch/restart WinUAE.
- * Usage: node scripts/load-disk.mjs <path-to-disk-or-zip>
+ * Load a disk image into DF0: and launch/restart WinUAE.
+ * Supports ADF (Amiga Disk File), ZIP (first image inside), ADZ, DMS, IPF.
+ * Usage: node scripts/load-disk.mjs <path-to-disk.adf|.zip|...>
  */
 import { WinUAEConnection } from '../dist/winuae-connection.js';
 import * as path from 'path';
 
 const diskPath = process.argv[2];
 if (!diskPath) {
-  console.error('Usage: node scripts/load-disk.mjs <path-to-disk-or-zip>');
+  console.error('Usage: node scripts/load-disk.mjs <path-to-disk.adf|.zip|...>');
   process.exit(1);
 }
 

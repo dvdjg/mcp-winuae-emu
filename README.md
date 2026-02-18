@@ -119,6 +119,11 @@ The server reads your config, merges in GDB-required settings, and launches `win
 |---|---|
 | `winuae_custom_registers` | Read and decode all custom chip registers ($DFF000-$DFF1FE) |
 | `winuae_copper_disassemble` | Decode a Copper list (WAIT, MOVE, SKIP, END) |
+| `winuae_gfx_state` | Display state: BPLCON0, bitplane/sprite pointers, DIW/DDF, DMACON, palette. For graphics extraction. |
+| `winuae_audio_state` | Paula state: AUD0–3 sample ptr, length, period, volume; optional raw sample hex dump. |
+| `winuae_bitmap_read` | Read raw bitplane data from chip RAM (address, row_bytes, height, num_planes). |
+| `winuae_memory_search` | Search RAM for hex pattern (e.g. Copper, graphics). Returns first match offset. |
+| `winuae_custom_write` | Write 16-bit to custom register by name (BPLCON0, DMACON, etc.). Toggle bitplanes/sprites. |
 | `winuae_disassemble` | Basic m68k disassembly (raw words) |
 | `winuae_disassemble_full` | Full m68k disassembly via WinUAE sm68k (requires monitor command support) |
 
@@ -154,6 +159,10 @@ When using WinUAE-DBG or Bartman fork with monitor support, the MCP server can s
 ### Frame profiling
 
 The `winuae_profile` tool runs WinUAE’s monitor command `profile` and writes a binary file that contains the same exhaustive data as the [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame Profiler and Graphics Debugger: CPU samples, DMA records per scanline (CRT beam position, blitter, bitplanes, sprites), custom chip registers, AGA colors, blitter resources, and a screenshot per frame. You can open the file in the extension’s profiler UI or parse it for autonomous analysis (e.g. from an MCP client).
+
+### Graphics, audio, and low-level analysis
+
+To **extract graphics and sound** from a running game or binary: use `winuae_gfx_state` to read the current display setup (bitplane pointers, dimensions, palette), then `winuae_bitmap_read` to dump raw bitplane data from chip RAM, or `winuae_audio_state` (with `samples_hex: true`) to get Paula channel state and raw sample data. To **inspect behavior** (e.g. [coppenheimer](https://github.com/losso3000/coppenheimer)-style): use `winuae_custom_write` to set BPLCON0 or DMACON and toggle bitplanes or sprites on/off; use `winuae_memory_search` to find Copper lists or patterns in memory. Together with `winuae_custom_registers`, `winuae_copper_disassemble`, and the frame profiler, you can get a low-level description of mechanics, timings, and assets for autonomous analysis.
 
 ### Technical notes
 
