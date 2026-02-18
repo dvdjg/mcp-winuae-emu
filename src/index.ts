@@ -600,8 +600,98 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'winuae_screenshot',
+    description: 'Capture a screenshot of the emulated Amiga display and save to a PNG file. Uses WinUAE GDB monitor command. File path is on the host system.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filepath: {
+          type: 'string',
+          description: 'Full path on host to save the PNG file (e.g., C:\\temp\\screenshot.png)',
+        },
+      },
+      required: ['filepath'],
+    },
+  },
+  {
+    name: 'winuae_disassemble_full',
+    description: 'Full m68k disassembly at address using WinUAE sm68k disassembler. More accurate than winuae_disassemble.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Start address (hex with $ or 0x prefix)',
+        },
+        count: {
+          type: 'number',
+          description: 'Number of instructions to disassemble (default: 20)',
+          default: 20,
+        },
+      },
+      required: ['address'],
+    },
+  },
+  {
+    name: 'winuae_input_key',
+    description: 'Simulate Amiga keyboard: send key press or release by raw scancode (0x00-0x7F). 1=press, 0=release.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scancode: {
+          type: ['string', 'number'],
+          description: 'Amiga raw scancode (e.g. 0x45 for Return)',
+        },
+        state: {
+          type: 'number',
+          description: '1=press, 0=release (default 1)',
+          default: 1,
+        },
+      },
+      required: ['scancode'],
+    },
+  },
+  {
+    name: 'winuae_input_event',
+    description: 'Send raw WinUAE input event. Event IDs come from config (input.1.keyboard.0.button.N = event ID). Use for precise control.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        event_id: {
+          type: ['string', 'number'],
+          description: 'WinUAE event ID from config',
+        },
+        state: {
+          type: ['string', 'number'],
+          description: '1=press, 0=release, 2=toggle (default 1)',
+          default: 1,
+        },
+      },
+      required: ['event_id'],
+    },
+  },
+  {
+    name: 'winuae_run_program',
+    description: 'Load an Amiga executable into memory, set PC to entry, and start execution.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          description: 'Path to Amiga executable on host',
+        },
+        entry: {
+          type: ['string', 'number'],
+          description: 'Entry address (default: 0x40000)',
+          default: '0x40000',
+        },
+      },
+      required: ['file'],
+    },
+  },
+  {
     name: 'winuae_disassemble',
-    description: 'Read memory and show as raw 68k words. Note: basic decode only — shows known opcodes (RTS, NOP, etc.) and raw DC.W for others.',
+    description: 'Read memory and show as raw 68k words. Note: basic decode only — use winuae_disassemble_full for full disassembly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -775,8 +865,16 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const addr = parseHexOrDecimal(args.address);
         const bytes = Buffer.from(args.data.replace(/[^0-9A-Fa-f]/g, ''), 'hex');
         const protocol = connection.getProtocol();
+        // Many GDB stubs only honour M when halted. Set WINUAE_MEMORY_WRITE_NO_PAUSE=1 to try with CPU running.
+        if (process.env.WINUAE_MEMORY_WRITE_NO_PAUSE !== '1') {
+          try {
+            await protocol.pause();
+          } catch {
+            // Already paused or pause failed; try write anyway
+          }
+        }
         await protocol.writeMemory(addr, bytes);
-        return { content: [{ type: 'text', text: `Wrote ${bytes.length} bytes to ${hex32(addr)}` }] };
+        return { content: [{ type: 'text', text: `Wrote ${bytes.length} bytes to ${hex32(addr)}. CPU is paused; use winuae_continue to resume.` }] };
       }
 
       case 'winuae_memory_dump': {
@@ -936,10 +1034,67 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const addr = parseHexOrDecimal(args.address);
         const count = args.count || 20;
         const protocol = connection.getProtocol();
-        // Read enough bytes (worst case: 10 bytes per instruction for m68k)
         const data = await protocol.readMemory(addr, count * 2);
         const disasm = disassembleM68k(data, addr, count);
         return { content: [{ type: 'text', text: disasm }] };
+      }
+
+      case 'winuae_screenshot': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { filepath } = args;
+        const { resolve } = await import('path');
+        const absPath = resolve(filepath);
+        const protocol = connection.getProtocol();
+        const hexReply = await protocol.sendMonitorCommand(`screenshot ${absPath}`, 15000);
+          const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
+          return { content: [{ type: 'text', text: `Screenshot saved: ${textReply}` }] };
+      }
+
+      case 'winuae_disassemble_full': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const addr = parseHexOrDecimal(args.address);
+        const count = args.count ?? 20;
+        const protocol = connection.getProtocol();
+        const hexReply = await protocol.sendMonitorCommand(`disasm ${addr.toString(16)} ${count}`, 10000);
+          const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
+          return { content: [{ type: 'text', text: textReply }] };
+      }
+
+      case 'winuae_run_program': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { file, entry = '0x40000' } = args;
+        const { readFileSync, existsSync } = await import('fs');
+        const { resolve } = await import('path');
+        const absPath = resolve(file);
+        if (!existsSync(absPath)) throw new Error(`File not found: ${absPath}`);
+        if (isDiskImage(absPath)) throw new Error('Use winuae_insert_disk for disk images');
+        const fileData = readFileSync(absPath);
+        const entryAddr = parseHexOrDecimal(entry);
+        const protocol = connection.getProtocol();
+        await protocol.writeMemory(entryAddr, fileData);
+        await protocol.writeRegister(17, entryAddr); // PC
+        await protocol.continue();
+        return { content: [{ type: 'text', text: `Loaded ${fileData.length} bytes at ${hex32(entryAddr)} and started. Call winuae_wait_stop to wait for breakpoint.` }] };
+      }
+
+      case 'winuae_input_key': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { scancode, state = 1 } = args;
+        const sc = parseHexOrDecimal(scancode);
+        const st = state ? 1 : 0;
+        const protocol = connection.getProtocol();
+        await protocol.sendMonitorCommand(`input key ${sc} ${st}`, 5000);
+        return { content: [{ type: 'text', text: `Sent key scancode ${hex8(sc)} ${st ? 'press' : 'release'}` }] };
+      }
+
+      case 'winuae_input_event': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const { event_id, state = 1 } = args;
+        const evt = parseHexOrDecimal(event_id);
+        const st = parseHexOrDecimal(state);
+        const protocol = connection.getProtocol();
+        await protocol.sendMonitorCommand(`input event ${evt} ${st}`, 5000);
+        return { content: [{ type: 'text', text: `Sent input event ${evt} state ${st}` }] };
       }
 
       default:

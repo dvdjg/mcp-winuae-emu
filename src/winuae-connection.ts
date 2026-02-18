@@ -114,26 +114,30 @@ export class WinUAEConnection {
     this.logFilePath = path.join(logDir, `winuae-${Date.now()}.log`);
     const logFd = fs.openSync(this.logFilePath, 'w');
 
-    // Launch args: same as scripts/start-winuae-for-mcp-debug.ps1 (which works).
-    // -portable -G, GDB settings, floppies, then -f configFile to load user config directly.
-    const args: string[] = [
-      '-portable',
-      '-G',
-      '-s', 'debugging_features=gdbserver',
-      '-s', 'debugging_trigger=',
-    ];
-    if (process.env.WINUAE_USE_GUI_NO !== '0') {
-      args.splice(2, 0, '-s', 'use_gui=no');  // Start directly into emulation (no config window)
-    }
-
-    // Inject floppy disk settings as CLI overrides
-    for (const [drive, diskPath] of this.floppies) {
-      args.push('-s', `floppy${drive}=${diskPath}`);
-    }
-
-    // Load user config with -f (same as start-winuae-for-mcp-debug.ps1)
+    // Launch args: load user config FIRST so our -s overrides apply on top.
+    // Then -portable -G, -s use_gui=no (unless WINUAE_USE_GUI_NO=0), GDB, floppies.
+    const args: string[] = [];
     if (useConfigFile && configFileAbs) {
       args.push('-f', configFileAbs);
+    }
+    args.push('-portable', '-G');
+    if (process.env.WINUAE_USE_GUI_NO !== '0') {
+      args.push('-s', 'use_gui=no');  // Start directly into emulation (no config window)
+    }
+    args.push(
+      '-s', 'debugging_features=gdbserver',
+      '-s', 'debugging_trigger=',
+    );
+    // If no DF0: was set via winuae_insert_disk, use WINUAE_BOOT_ADF so the Amiga boots (avoids black screen).
+    if (!this.floppies.has(0) && process.env.WINUAE_BOOT_ADF) {
+      const bootAdf = path.resolve(process.env.WINUAE_BOOT_ADF);
+      if (fs.existsSync(bootAdf)) {
+        args.push('-s', `floppy0=${bootAdf}`);
+        console.error(`[WinUAE] Boot ADF (WINUAE_BOOT_ADF): ${bootAdf}`);
+      }
+    }
+    for (const [drive, diskPath] of this.floppies) {
+      args.push('-s', `floppy${drive}=${diskPath}`);
     }
 
     console.error(`[WinUAE] Launching ${exePath} ${args.join(' ')}`);

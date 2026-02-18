@@ -78,15 +78,19 @@ export class GdbProtocol {
     const supported = await this.sendCommand('qSupported:multiprocess+;swbreak+;hwbreak+');
     this.debug(`[GDB] qSupported response: ${supported}`);
 
-    // Try to enable no-ack mode for speed
-    try {
-      const ackReply = await this.sendCommand('QStartNoAckMode');
-      if (ackReply === 'OK') {
-        this.noAckMode = true;
-        this.debug('[GDB] No-ack mode enabled');
+    // Try to enable no-ack mode for speed (skip if WINUAE_USE_ACK=1; some stubs need acks for M packet)
+    if (process.env.WINUAE_USE_ACK !== '1') {
+      try {
+        const ackReply = await this.sendCommand('QStartNoAckMode');
+        if (ackReply === 'OK') {
+          this.noAckMode = true;
+          this.debug('[GDB] No-ack mode enabled');
+        }
+      } catch {
+        this.debug('[GDB] No-ack mode not supported, continuing with acks');
       }
-    } catch {
-      this.debug('[GDB] No-ack mode not supported, continuing with acks');
+    } else {
+      this.debug('[GDB] WINUAE_USE_ACK=1: keeping ack mode (may help memory write)');
     }
 
     // Query halt reason
@@ -324,22 +328,72 @@ export class GdbProtocol {
   private static readonly WRITE_CHUNK = 4096;
 
   /**
-   * Write memory: sends 'M<addr>,<len>:<hex>' in chunks to avoid WinUAE crashes on large executables.
+   * Escape binary data for GDB X packet: 0x7d -> 0x7d 0x5d, 0x23 (#) -> 0x7d 0x03, 0x24 ($) -> 0x7d 0x04.
+   */
+  private static escapeXPacketData(data: Buffer): Buffer {
+    const out: number[] = [];
+    for (let i = 0; i < data.length; i++) {
+      const b = data[i];
+      if (b === 0x7d || b === 0x23 || b === 0x24) {
+        out.push(0x7d, b ^ 0x20);
+      } else {
+        out.push(b);
+      }
+    }
+    return Buffer.from(out);
+  }
+
+  /**
+   * Write memory: try M packet first, then X (binary) as fallback.
+   * Uses 30s timeout. Logs send/result when WINUAE_DEBUG=1 or on failure.
    */
   async writeMemory(addr: number, data: Buffer): Promise<void> {
+    const timeoutMs = 30000;
+    const log = (msg: string) => {
+      this.debug(msg);
+      console.error(`[GDB memory] ${msg}`);
+    };
     let offset = 0;
     let currentAddr = addr;
     while (offset < data.length) {
       const chunkLen = Math.min(GdbProtocol.WRITE_CHUNK, data.length - offset);
       const chunk = data.subarray(offset, offset + chunkLen);
       const hex = chunk.toString('hex');
-      const reply = await this.sendCommand(`M${currentAddr.toString(16)},${chunkLen.toString(16)}:${hex}`);
+      const mPacket = `M${currentAddr.toString(16)},${chunkLen.toString(16)}:${hex}`;
+      log(`[SEND] M ${mPacket.slice(0, 80)}${mPacket.length > 80 ? '...' : ''}`);
+      let reply: string;
+      try {
+        reply = await this.sendCommand(mPacket, timeoutMs);
+        log(`[RECV] ${reply}`);
+      } catch (err) {
+        log(`M packet failed: ${(err as Error).message}. Trying X packet...`);
+        const escaped = GdbProtocol.escapeXPacketData(chunk);
+        const xPayload = 'X' + currentAddr.toString(16) + ',' + chunkLen.toString(16) + ':' + escaped.toString('binary');
+        reply = await this.sendCommand(xPayload, timeoutMs);
+        log(`[RECV] X ${reply}`);
+      }
       if (reply !== 'OK') {
         throw new Error(`Memory write error at $${currentAddr.toString(16)}: ${reply}`);
       }
       offset += chunkLen;
       currentAddr += chunkLen;
     }
+  }
+
+  // ─── Monitor Commands (qRcmd) ────────────────────────────────────────────
+
+  /**
+   * Send a monitor command (qRcmd). The command is hex-encoded in the packet.
+   * WinUAE Bartman GDB server supports: screenshot, disasm, profile, reset
+   * Returns the hex-encoded response (decode with Buffer.from(hex, 'hex').toString('utf8'))
+   */
+  async sendMonitorCommand(command: string, timeoutMs: number = 60000): Promise<string> {
+    const hexCmd = Buffer.from(command, 'utf8').toString('hex');
+    const reply = await this.sendCommand(`qRcmd,${hexCmd}`, timeoutMs);
+    if (reply.startsWith('E')) {
+      throw new Error(`Monitor command failed: ${reply}`);
+    }
+    return reply;
   }
 
   // ─── Breakpoint Commands ────────────────────────────────────────────
