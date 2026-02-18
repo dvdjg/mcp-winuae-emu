@@ -247,7 +247,7 @@ function disassembleM68k(data: Buffer, baseAddr: number, count: number): string 
 
 // ─── Disk Image Detection ────────────────────────────────────────────
 
-const DISK_IMAGE_EXTENSIONS = new Set(['.adf', '.adz', '.dms', '.ipf', '.fdi', '.scp']);
+const DISK_IMAGE_EXTENSIONS = new Set(['.adf', '.adz', '.dms', '.ipf', '.fdi', '.scp', '.zip']);
 
 function isDiskImage(filePath: string): boolean {
   return DISK_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
@@ -293,7 +293,7 @@ const tools: Tool[] = [
   // Load/Reset
   {
     name: 'winuae_load',
-    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary. For disk images (.adf etc.), inserts into DF0: and restarts.',
+    description: 'Load an Amiga executable into memory by writing it via GDB. Provide the host path to the compiled binary. For disk images (.adf, .zip etc.), inserts into DF0: and restarts. ZIP files are opened by WinUAE; it uses the first disk image inside.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -322,13 +322,13 @@ const tools: Tool[] = [
   // Disk tools
   {
     name: 'winuae_insert_disk',
-    description: 'Insert a floppy disk image (ADF, ADZ, DMS, IPF) into a drive. Restarts WinUAE to apply. Use drive 0 for DF0: (boot drive).',
+    description: 'Insert a floppy disk image (ADF, ADZ, DMS, IPF, ZIP) into a drive. Restarts WinUAE to apply. ZIP files: WinUAE extracts the first disk image. Use drive 0 for DF0: (boot drive).',
     inputSchema: {
       type: 'object',
       properties: {
         file: {
           type: 'string',
-          description: 'Path to disk image file (.adf, .adz, .dms, .ipf)',
+          description: 'Path to disk image file (.adf, .adz, .dms, .ipf, .zip)',
         },
         drive: {
           type: 'number',
