@@ -292,10 +292,11 @@ export class GdbProtocol {
 
   /**
    * Write a single register by index: sends 'P<id>=<hex>'
+   * Uses a longer timeout — WinUAE GDB server responds slowly to register writes.
    */
   async writeRegister(id: number, value: number): Promise<void> {
     const hex = (value >>> 0).toString(16).padStart(8, '0');
-    const reply = await this.sendCommand(`P${id.toString(16)}=${hex}`);
+    const reply = await this.sendCommand(`P${id.toString(16)}=${hex}`, 30000);
     if (reply !== 'OK') throw new Error(`Register write failed for reg ${id}: ${reply}`);
   }
 
@@ -324,9 +325,6 @@ export class GdbProtocol {
     return Buffer.from(reply, 'hex');
   }
 
-  /** Chunk size for memory writes to avoid overloading WinUAE GDB server (large M packets can crash). */
-  private static readonly WRITE_CHUNK = 4096;
-
   /**
    * Escape binary data for GDB X packet: 0x7d -> 0x7d 0x5d, 0x23 (#) -> 0x7d 0x03, 0x24 ($) -> 0x7d 0x04.
    */
@@ -345,9 +343,10 @@ export class GdbProtocol {
 
   /**
    * Write memory: try M packet first, then X (binary) as fallback.
-   * Uses 30s timeout. Logs send/result when WINUAE_DEBUG=1 or on failure.
+   * Uses 256-byte chunks for reliability; 30s timeout per chunk.
    */
   async writeMemory(addr: number, data: Buffer): Promise<void> {
+    const CHUNK_SIZE = 256;
     const timeoutMs = 30000;
     const log = (msg: string) => {
       this.debug(msg);
@@ -356,7 +355,7 @@ export class GdbProtocol {
     let offset = 0;
     let currentAddr = addr;
     while (offset < data.length) {
-      const chunkLen = Math.min(GdbProtocol.WRITE_CHUNK, data.length - offset);
+      const chunkLen = Math.min(CHUNK_SIZE, data.length - offset);
       const chunk = data.subarray(offset, offset + chunkLen);
       const hex = chunk.toString('hex');
       const mPacket = `M${currentAddr.toString(16)},${chunkLen.toString(16)}:${hex}`;
@@ -383,9 +382,9 @@ export class GdbProtocol {
   // ─── Monitor Commands (qRcmd) ────────────────────────────────────────────
 
   /**
-   * Send a monitor command (qRcmd). The command is hex-encoded in the packet.
-   * WinUAE Bartman GDB server supports: screenshot, disasm, profile, reset
-   * Returns the hex-encoded response (decode with Buffer.from(hex, 'hex').toString('utf8'))
+   * Send a monitor command (qRcmd). Command is hex-encoded in the packet.
+   * WinUAE Bartman GDB server supports: screenshot, disasm, profile, reset, input key/event
+   * Returns hex-encoded response; decode with Buffer.from(hex, 'hex').toString('utf8')
    */
   async sendMonitorCommand(command: string, timeoutMs: number = 60000): Promise<string> {
     const hexCmd = Buffer.from(command, 'utf8').toString('hex');
