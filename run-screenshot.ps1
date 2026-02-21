@@ -1,0 +1,6 @@
+$env:WINUAE_CONNECT_EXISTING = "1"
+$env:WINUAE_PATH = "c:\Users\dvdjg\Documents\programa\AI\WinUAE-DBG\bin"
+$env:WINUAE_CONFIG = "c:\Users\dvdjg\Documents\programa\AI\Cursor-Amiga-C\.vscode\mcp-amiga-debug.uae"
+$env:WINUAE_GDB_PORT = "2345"
+Set-Location "C:\Users\dvdjg\Documents\programa\AI\mcp-winuae-emu"
+node scripts/screenshot.mjs "C:\Users\dvdjg\Documents\programa\AI\Cursor-Amiga-C\out\amiga-capture.png"

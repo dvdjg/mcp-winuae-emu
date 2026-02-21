@@ -4,6 +4,7 @@
  */
 
 import { Socket } from 'net';
+import { trace, traceErr } from './trace.js';
 
 // m68k register layout in GDB order (18 regs × 4 bytes each, big-endian)
 export interface M68kRegisters {
@@ -46,20 +47,26 @@ export class GdbProtocol {
    * Connect to GDB server and perform handshake
    */
   async connect(host: string, port: number): Promise<void> {
+    const connectTimeoutMs = parseInt(process.env.WINUAE_GDB_CONNECT_TIMEOUT_MS || '3000', 10);
+    trace(`GDB connect ${host}:${port} timeout=${connectTimeoutMs}ms`);
+
     this.socket = new Socket();
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error('GDB connection timeout'));
-      }, 5000);
+        traceErr('GDB TCP connect timeout', new Error('timeout'));
+        reject(new Error(`GDB connection timeout (${connectTimeoutMs}ms)`));
+      }, connectTimeoutMs);
 
       this.socket!.connect(port, host, () => {
         clearTimeout(timeout);
+        trace('GDB TCP connected');
         resolve();
       });
 
       this.socket!.on('error', (err) => {
         clearTimeout(timeout);
+        traceErr('GDB TCP error', err);
         reject(err);
       });
     });
@@ -74,8 +81,19 @@ export class GdbProtocol {
       this.rejectAll(new Error('Socket closed'));
     });
 
-    // Handshake: feature negotiation
-    const supported = await this.sendCommand('qSupported:multiprocess+;swbreak+;hwbreak+');
+    // WinUAE only processes packets after Amiga hits a breakpoint and enters debugger.
+    // For ADF games without debugging_trigger, we need to send Ctrl+C first to force debug mode.
+    // Send Ctrl+C (0x03) to interrupt execution and enter debug mode.
+    const forceBreak = process.env.WINUAE_FORCE_BREAK !== '0';
+    if (forceBreak) {
+      trace('[GDB] Sending Ctrl+C to force debug mode...');
+      this.socket.write(Buffer.from([0x03]));
+      // Wait a bit for WinUAE to process the break
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    // Allow up to 60s for the first command (boot + hit breakpoint).
+    const supported = await this.sendCommand('qSupported:multiprocess+;swbreak+;hwbreak+', 60000);
     this.debug(`[GDB] qSupported response: ${supported}`);
 
     // Try to enable no-ack mode for speed (skip if WINUAE_USE_ACK=1; some stubs need acks for M packet)
@@ -102,7 +120,9 @@ export class GdbProtocol {
    * Handle incoming TCP data
    */
   private handleData(data: Buffer): void {
-    this.pendingData += data.toString('binary');
+    const raw = data.toString('binary');
+    if (this.debugMode && raw.length > 0) trace(`[GDB RX] ${raw.length}B: ${JSON.stringify(raw.slice(0, 80))}${raw.length > 80 ? '...' : ''}`);
+    this.pendingData += raw;
 
     while (this.pendingData.length > 0) {
       // Handle ack/nack bytes
@@ -160,8 +180,8 @@ export class GdbProtocol {
 
       this.debug(`[GDB] [RECV] ${packetData.slice(0, 100)}${packetData.length > 100 ? '...' : ''}`);
 
-      // O packets are async console output from GDB server -- log and skip
-      if (packetData.startsWith('O')) {
+      // O packets are async console output: O + hex-encoded text. Do not treat "OK" as O packet.
+      if (packetData.startsWith('O') && packetData.length > 1 && /^O[0-9a-fA-F]+$/.test(packetData)) {
         try {
           const hexText = packetData.slice(1);
           const text = Buffer.from(hexText, 'hex').toString('utf8').trim();
@@ -212,7 +232,7 @@ export class GdbProtocol {
   private sendPacket(data: string): void {
     const checksum = this.computeChecksum(data);
     const packet = `$${data}#${checksum.toString(16).padStart(2, '0')}`;
-    this.debug(`[GDB] [SEND] ${data.slice(0, 100)}${data.length > 100 ? '...' : ''}`);
+    if (this.debugMode) trace(`[GDB TX] ${data.slice(0, 80)}${data.length > 80 ? '...' : ''}`);
     this.socketWrite(packet);
   }
 

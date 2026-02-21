@@ -1339,10 +1339,9 @@ process.on('SIGTERM', async () => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[MCP WinUAE] Server running');
-  console.error(`[MCP WinUAE] WinUAE path: ${config.winuaePath}`);
-  console.error(`[MCP WinUAE] Config file: ${config.configFile}`);
-  console.error(`[MCP WinUAE] GDB port: ${config.gdbPort}`);
+  const { trace } = await import('./trace.js');
+  trace('MCP server running');
+  trace(`config: winuaePath=${config.winuaePath} exe=${process.env.WINUAE_EXE || 'winuae-gdb.exe'} port=${config.gdbPort}`);
 }
 
 main().catch((error) => {
