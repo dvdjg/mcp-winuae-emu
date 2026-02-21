@@ -319,6 +319,23 @@ const tools: Tool[] = [
     },
   },
 
+  // Warp/turbo mode control
+  {
+    name: 'winuae_warp',
+    description: 'Control warp/turbo mode to run emulation at maximum speed (useful for fast loading, skipping intros). Mode: 1/on = enable turbo, 0/off = disable turbo, status = check current state. In warp mode, audio is disabled and emulation runs as fast as the host CPU allows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['on', 'off', '1', '0', 'status'],
+          description: 'Warp mode: on/1 = enable turbo, off/0 = normal speed, status = query state',
+          default: 'status',
+        },
+      },
+    },
+  },
+
   // Disk tools
   {
     name: 'winuae_insert_disk',
@@ -910,6 +927,19 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         return { content: [{ type: 'text', text: `Reset complete. ${statusMsg}\n${formatRegisters(regs)}` }] };
       }
 
+      case 'winuae_warp': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const mode = args.mode || 'status';
+        const result = await protocol.sendMonitorCommand(`warp ${mode}`, 5000);
+        if (result.startsWith('warp=')) {
+          const state = result.includes('warp=1') ? 'enabled (turbo)' : 'disabled (normal)';
+          return { content: [{ type: 'text', text: `Warp mode is ${state}` }] };
+        }
+        const stateMsg = mode === '1' || mode === 'on' ? 'Warp mode ENABLED (turbo speed)' : 'Warp mode DISABLED (normal speed)';
+        return { content: [{ type: 'text', text: stateMsg }] };
+      }
+
       case 'winuae_insert_disk': {
         const { file, drive = 0 } = args;
         const { existsSync } = await import('fs');
@@ -929,7 +959,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (connection.connected) {
           const protocol = connection.getProtocol();
           try {
-            await protocol.sendMonitorCommand(`df${drive} insert ${absPath}`, 15000);
+            // Quote path to handle spaces in filenames
+            await protocol.sendMonitorCommand(`df${drive} insert "${absPath}"`, 15000);
             return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: (hot-swap, no restart).` }] };
           } catch {
             const statusMsg = await connection.restart();

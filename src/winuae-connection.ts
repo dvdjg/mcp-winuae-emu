@@ -126,14 +126,21 @@ export class WinUAEConnection {
     const logFd = fs.openSync(this.logFilePath, 'w');
 
     // Launch args: load user config FIRST so our -s overrides apply on top.
-    // Then -portable -G, -s use_gui=no (unless WINUAE_USE_GUI_NO=0), GDB, floppies.
+    // -G is required for auto-start without config dialog.
+    // WINUAE_HEADLESS=1 hides window completely (for CI/testing).
     const args: string[] = [];
     if (useConfigFile && configFileAbs) {
       args.push('-f', configFileAbs);
     }
-    args.push('-portable', '-G');
-    if (process.env.WINUAE_USE_GUI_NO !== '0') {
-      args.push('-s', 'use_gui=no');  // Start directly into emulation (no config window)
+    args.push('-portable');
+    const headless = process.env.WINUAE_HEADLESS === '1';
+    // -G: Start emulation immediately without showing config dialog
+    // Without -G, WinUAE shows config dialog and waits for user to click Start
+    args.push('-G');
+    // -s headless=no: Show emulator window (by default -G enables headless mode)
+    // This allows the user to see the emulation while debugging
+    if (!headless) {
+      args.push('-s', 'headless=no');
     }
     args.push('-s', 'debugging_features=gdbserver');
     // Do NOT override debugging_trigger: let config file decide (e.g. :a.exe).
@@ -155,12 +162,12 @@ export class WinUAEConnection {
 
     trace(`Launching ${exePath} ${args.join(' ')}`);
     trace(`GDB port: ${this.config.gdbPort}, log: ${this.logFilePath}`);
-
+    
     this.process = spawn(exePath, args, {
       stdio: ['ignore', logFd, logFd],
       detached: false,
       cwd: path.resolve(this.config.winuaePath),
-      windowsHide: true,
+      windowsHide: headless,
     });
 
     this.process.on('error', (err) => {
