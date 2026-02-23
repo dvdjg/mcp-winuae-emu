@@ -114,6 +114,15 @@ export class GdbProtocol {
     // Query halt reason
     const haltReason = await this.sendCommand('?');
     this.debug(`[GDB] Halt reason: ${haltReason}`);
+    
+    // Send qOffsets to trigger baseText calculation in WinUAE-DBG
+    // This is essential for breakpoint relocation when debugging user programs
+    try {
+      const offsets = await this.sendCommand('qOffsets');
+      this.debug(`[GDB] qOffsets response: ${offsets}`);
+    } catch (e) {
+      this.debug(`[GDB] qOffsets not supported or failed: ${e}`);
+    }
   }
 
   /**

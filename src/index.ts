@@ -781,6 +781,20 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'winuae_findproc',
+    description: 'Search for a named process in AmigaOS and update baseText for breakpoint relocation. Use after the program has started to fix breakpoint issues when baseText=0. Returns process info or list of current processes if not found.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Process name to search for (e.g. "a.exe"). If omitted, uses the debugging_trigger name.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'winuae_disassemble',
     description: 'Read memory and show as raw 68k words. Note: basic decode only — use winuae_disassemble_full for full disassembly.',
     inputSchema: {
@@ -1268,6 +1282,16 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         await protocol.writeRegister(17, entryAddr); // PC
         await protocol.continue();
         return { content: [{ type: 'text', text: `Loaded ${fileData.length} bytes at ${hex32(entryAddr)} and started. Call winuae_wait_stop to wait for breakpoint.` }] };
+      }
+
+      case 'winuae_findproc': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const name = args.name ?? '';
+        const cmd = name ? `findproc ${name}` : 'findproc';
+        const hexReply = await protocol.sendMonitorCommand(cmd, 10000);
+        const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: textReply }] };
       }
 
       case 'winuae_input_key': {

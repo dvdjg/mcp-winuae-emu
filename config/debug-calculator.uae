@@ -1,0 +1,28 @@
+; Configuración para depurar la calculadora Amiga
+; Generado para pruebas de depuración
+
+; Sistema base: A500
+quickstart=a500,1
+ntsc=false
+
+; Debugging
+debugging_features=gdbserver
+debugging_trigger=:a.exe
+
+; Disco con el programa
+floppy0=C:\Users\dvdjg\Documents\programa\AI\Cursor-Amiga-C\out\disk.adf
+floppy0type=0
+
+; Memoria
+chipmem_size=2
+bogomem_size=0
+fastmem_size=4
+
+; CPU
+cpu_speed=max
+cpu_type=68000
+cpu_model=68000
+cpu_compatible=true
+
+; Warp mode para cargar más rápido
+warp=true
