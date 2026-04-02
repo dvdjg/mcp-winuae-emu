@@ -80,7 +80,8 @@ The server reads your config, merges in GDB-required settings, and launches `win
 
 | Tool | Description |
 |---|---|
-| `winuae_connect` | Launch WinUAE and connect to GDB server |
+| `winuae_connect` | Launch WinUAE and connect to GDB server. Optional `config_file` overrides `WINUAE_CONFIG` for this session. |
+| `winuae_connect_existing` | Attach to GDB on port 2345 (WinUAE already running). |
 | `winuae_disconnect` | Disconnect and stop the emulator |
 | `winuae_status` | Check if connected and responsive |
 
@@ -129,8 +130,9 @@ The server reads your config, merges in GDB-required settings, and launches `win
 
 | Tool | Description |
 |---|---|
-| `winuae_screenshot` | Capture emulator display to PNG file (host path). Uses GDB monitor `screenshot`. |
+| `winuae_screenshot` | Capture display to PNG: `filepath` (full path) or `filename` (basename in temp); default timestamped name in temp. |
 | `winuae_run_program` | Load binary into memory, set PC, and start execution. For testing executables. |
+| `winuae_exec_chunk` | Write hex-encoded machine code at `address`, set PC (and optional SP/A7), optionally `continue_after`. |
 | `winuae_profile` | Run frame profiler for N frames; writes binary with CPU samples, DMA per scanline (CRT/blitter), custom regs, screenshots. Same format as [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame/Graphics profiler. |
 | `winuae_input_key` | Simulate Amiga keyboard: raw scancode press/release (e.g. 0x45=Return). |
 | `winuae_input_event` | Send raw WinUAE input event (event ID from config). Precise control. |

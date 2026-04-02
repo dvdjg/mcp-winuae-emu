@@ -259,10 +259,15 @@ const tools: Tool[] = [
   // Connection tools
   {
     name: 'winuae_connect',
-    description: 'Launch WinUAE (BartmanAbyss fork) and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH env var to override default path.',
+    description: 'Launch WinUAE (BartmanAbyss fork) and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH and WINUAE_CONFIG env vars, or pass config_file for a one-off .uae path.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        config_file: {
+          type: 'string',
+          description: 'Optional absolute path to a WinUAE .uae file (overrides WINUAE_CONFIG for this session).',
+        },
+      },
     },
   },
   {
@@ -270,7 +275,12 @@ const tools: Tool[] = [
     description: 'Connect to an already-running WinUAE GDB server (port 2345). Do not start WinUAE. Use when WinUAE was started by F5 or by a script; then use breakpoints/memory/step without calling winuae_load.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        config_file: {
+          type: 'string',
+          description: 'Ignored for hardware (emulator already running); reserved for future use / logging.',
+        },
+      },
     },
   },
   {
@@ -645,20 +655,6 @@ const tools: Tool[] = [
     },
   },
   {
-    name: 'winuae_screenshot',
-    description: 'Capture a screenshot of the emulated Amiga display and save to a PNG file. Uses WinUAE GDB monitor command. File path is on the host system.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        filepath: {
-          type: 'string',
-          description: 'Full path on host to save the PNG file (e.g., C:\\temp\\screenshot.png)',
-        },
-      },
-      required: ['filepath'],
-    },
-  },
-  {
     name: 'winuae_disassemble_full',
     description: 'Full m68k disassembly at address using WinUAE sm68k disassembler. More accurate than winuae_disassemble.',
     inputSchema: {
@@ -815,15 +811,50 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_screenshot',
-    description: 'Capture current screen buffer and save as PNG file.',
+    description: 'Capture emulated Amiga display to PNG via WinUAE monitor. Use filepath for a full host path, or filename (basename only, saved under system temp). If neither given, uses winuae-screen-{timestamp}.png in temp.',
     inputSchema: {
       type: 'object',
       properties: {
+        filepath: {
+          type: 'string',
+          description: 'Full host path for the PNG (preferred).',
+        },
         filename: {
           type: 'string',
-          description: 'Output filename (default: winuae-screen-{timestamp}.png)',
+          description: 'Basename only; combined with system temp dir if not absolute.',
         },
       },
+    },
+  },
+  {
+    name: 'winuae_exec_chunk',
+    description: 'Write raw 680x0 machine code to Amiga memory, set PC (and optionally A7), optionally resume CPU. CPU is paused first. Use for tiny test stubs; you must supply valid code (e.g. ending in RTS) and a valid stack if you continue. GDB register indices: PC=17, A7=15.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Address to write bytes (hex with $ or 0x)',
+        },
+        hex: {
+          type: 'string',
+          description: 'Hex-encoded bytes (no spaces), even length. Example: 4e754e71 for RTS;NOP',
+        },
+        pc: {
+          type: ['string', 'number'],
+          description: 'PC after write (default: same as address)',
+        },
+        sp: {
+          type: ['string', 'number'],
+          description: 'Optional A7/stack pointer before continue',
+        },
+        continue_after: {
+          type: 'boolean',
+          description: 'If true (default), call continue after patching. If false, leave CPU paused.',
+          default: true,
+        },
+      },
+      required: ['address', 'hex'],
     },
   },
 ];
@@ -837,9 +868,11 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (connection?.connected) {
           return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
         }
-        if (!connection) {
-          connection = new WinUAEConnection(config);
-        }
+        const cfg: WinUAEConfig =
+          args?.config_file && String(args.config_file).trim()
+            ? { ...config, configFile: path.resolve(String(args.config_file).trim()) }
+            : config;
+        connection = new WinUAEConnection(cfg);
         const statusMsg = await connection.connectSmart();
         return { content: [{ type: 'text', text: statusMsg }] };
       }
@@ -848,9 +881,11 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (connection?.connected) {
           return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
         }
-        if (!connection) {
-          connection = new WinUAEConnection(config);
-        }
+        const cfgEx: WinUAEConfig =
+          args?.config_file && String(args.config_file).trim()
+            ? { ...config, configFile: path.resolve(String(args.config_file).trim()) }
+            : config;
+        connection = new WinUAEConnection(cfgEx);
         await connection.connectExisting();
         return { content: [{ type: 'text', text: `Connected to existing WinUAE GDB server on port ${config.gdbPort}. Do not call winuae_load (program already running).` }] };
       }
@@ -1265,6 +1300,39 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const hexReply = await protocol.sendMonitorCommand(`disasm ${addr.toString(16)} ${count}`, 10000);
           const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
           return { content: [{ type: 'text', text: textReply }] };
+      }
+
+      case 'winuae_exec_chunk': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        await protocol.pause();
+        const addr = parseHexOrDecimal(args.address);
+        const hexRaw = String(args.hex || '').replace(/\s+/g, '');
+        if (hexRaw.length % 2 !== 0) {
+          throw new Error('winuae_exec_chunk: hex string must have even length');
+        }
+        if (!/^[0-9a-fA-F]*$/.test(hexRaw)) {
+          throw new Error('winuae_exec_chunk: hex must contain only hex digits');
+        }
+        const buf = Buffer.from(hexRaw, 'hex');
+        await protocol.writeMemory(addr, buf);
+        const pcVal = args.pc !== undefined ? parseHexOrDecimal(args.pc) : addr;
+        await protocol.writeRegister(17, pcVal >>> 0);
+        if (args.sp !== undefined) {
+          await protocol.writeRegister(15, parseHexOrDecimal(args.sp) >>> 0);
+        }
+        const doCont = args.continue_after !== false;
+        if (doCont) {
+          await protocol.continue();
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Wrote ${buf.length} bytes at ${hex32(addr)}, PC=${hex32(pcVal)}${args.sp !== undefined ? ` A7=${hex32(parseHexOrDecimal(args.sp))}` : ''}. ${doCont ? 'CPU continued.' : 'CPU left paused.'}`,
+            },
+          ],
+        };
       }
 
       case 'winuae_run_program': {
