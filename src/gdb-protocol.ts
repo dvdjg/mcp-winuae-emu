@@ -372,39 +372,76 @@ export class GdbProtocol {
 
   /**
    * Write memory: try M packet first, then X (binary) as fallback.
-   * Uses 256-byte chunks for reliability; 30s timeout per chunk.
+   * Chunk size, timeout, and pacing are configurable for WinUAE builds that are
+   * sensitive to large writes during early boot/debug attach.
    */
   async writeMemory(addr: number, data: Buffer): Promise<void> {
-    const CHUNK_SIZE = 256;
-    const timeoutMs = 30000;
+    const chunkSize = Math.max(1, parseInt(process.env.WINUAE_GDB_WRITE_CHUNK_SIZE || '256', 10) || 256);
+    const minChunkSize = Math.max(1, parseInt(process.env.WINUAE_GDB_WRITE_MIN_CHUNK_SIZE || '16', 10) || 16);
+    const timeoutMs = Math.max(1000, parseInt(process.env.WINUAE_GDB_WRITE_TIMEOUT_MS || '30000', 10) || 30000);
+    const delayMs = Math.max(0, parseInt(process.env.WINUAE_GDB_WRITE_DELAY_MS || '0', 10) || 0);
     const log = (msg: string) => {
       this.debug(msg);
       console.error(`[GDB memory] ${msg}`);
     };
-    let offset = 0;
-    let currentAddr = addr;
-    while (offset < data.length) {
-      const chunkLen = Math.min(CHUNK_SIZE, data.length - offset);
-      const chunk = data.subarray(offset, offset + chunkLen);
+
+    const writeChunk = async (chunkAddr: number, chunk: Buffer): Promise<void> => {
+      const chunkLen = chunk.length;
       const hex = chunk.toString('hex');
-      const mPacket = `M${currentAddr.toString(16)},${chunkLen.toString(16)}:${hex}`;
+      const mPacket = `M${chunkAddr.toString(16)},${chunkLen.toString(16)}:${hex}`;
       log(`[SEND] M ${mPacket.slice(0, 80)}${mPacket.length > 80 ? '...' : ''}`);
-      let reply: string;
+      let reply: string | null = null;
+      let lastError: Error | null = null;
       try {
         reply = await this.sendCommand(mPacket, timeoutMs);
         log(`[RECV] ${reply}`);
       } catch (err) {
-        log(`M packet failed: ${(err as Error).message}. Trying X packet...`);
-        const escaped = GdbProtocol.escapeXPacketData(chunk);
-        const xPayload = 'X' + currentAddr.toString(16) + ',' + chunkLen.toString(16) + ':' + escaped.toString('binary');
-        reply = await this.sendCommand(xPayload, timeoutMs);
-        log(`[RECV] X ${reply}`);
+        lastError = err as Error;
+        log(`M packet failed: ${lastError.message}. Trying X packet...`);
       }
+
+      if (reply === null) {
+        try {
+          const escaped = GdbProtocol.escapeXPacketData(chunk);
+          const xPayload = 'X' + chunkAddr.toString(16) + ',' + chunkLen.toString(16) + ':' + escaped.toString('binary');
+          reply = await this.sendCommand(xPayload, timeoutMs);
+          log(`[RECV] X ${reply}`);
+        } catch (err) {
+          lastError = err as Error;
+          log(`X packet failed: ${lastError.message}`);
+        }
+      }
+
       if (reply !== 'OK') {
-        throw new Error(`Memory write error at $${currentAddr.toString(16)}: ${reply}`);
+        if (chunkLen > minChunkSize) {
+          const splitAt = Math.max(minChunkSize, Math.floor(chunkLen / 2));
+          const left = chunk.subarray(0, splitAt);
+          const right = chunk.subarray(splitAt);
+          log(`Retrying write at smaller chunk size: ${chunkLen} -> ${left.length}+${right.length}`);
+          await writeChunk(chunkAddr, left);
+          if (right.length > 0) {
+            if (delayMs > 0) {
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+            await writeChunk(chunkAddr + left.length, right);
+          }
+          return;
+        }
+        throw new Error(`Memory write error at $${chunkAddr.toString(16)}: ${reply ?? lastError?.message ?? 'unknown_error'}`);
       }
+    };
+
+    let offset = 0;
+    let currentAddr = addr;
+    while (offset < data.length) {
+      const chunkLen = Math.min(chunkSize, data.length - offset);
+      const chunk = data.subarray(offset, offset + chunkLen);
+      await writeChunk(currentAddr, chunk);
       offset += chunkLen;
       currentAddr += chunkLen;
+      if (delayMs > 0 && offset < data.length) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
     }
   }
 

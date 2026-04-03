@@ -128,6 +128,7 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | Tool | Description |
 |---|---|
 | `winuae_machine_snapshot` | Return a JSON snapshot with CPU registers, custom registers, and optional bounded chip/fast RAM windows. |
+| `winuae_postmortem_capture` | Capture a crash/stop postmortem bundle with parsed stop reason, CPU registers, stack dump, disassembly around PC, and optional snapshot data. |
 | `winuae_bitmap_decode` | Decode planar bitmap data from Amiga memory to PNG or inline RGBA using palette colors from args or current custom registers. |
 | `winuae_memory_pattern_search` | Search a RAM range for an exact byte pattern and optionally score repeated matches using a configurable stride. |
 | `winuae_custom_registers` | Read all $DFF000–$DFF1FE with names. Use to get BPL/AUD/DMACON/DIW/DDF/COLOR/SPR/COP1; derive bitmap and sample addresses, then use memory_read to dump. |
@@ -180,6 +181,7 @@ The `winuae_profile` tool runs WinUAE’s monitor command `profile` and writes a
 There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “memory_search”, or “custom_write” tools. Use the **core** tools as follows:
 - **Consistent machine snapshot**: Call `winuae_machine_snapshot` to get CPU + custom registers in one structured response, with optional chip/fast RAM windows. Each RAM window is capped at **16384 bytes** to keep MCP payloads bounded.
 - **Bitmap decode**: Call `winuae_bitmap_decode` with `address`, `width`, `height`, `bitplanes`, and optionally `row_bytes`, `interleaved`, `palette`, or `use_custom_palette=true`. Output can be PNG (`filepath`) or inline RGBA for small images.
+- **Crash/postmortem bundle**: Call `winuae_postmortem_capture` after a suspicious stop, requester, or crash to preserve stop reason, CPU, stack, disassembly around PC, and optional custom/chip snapshot data in JSON/Markdown.
 - **Pattern search**: Call `winuae_memory_pattern_search` with a RAM range plus `pattern_hex`. Add `stride_bytes` and `repeat_count` when searching repeated row signatures or record layouts; results come back as scored candidates with addresses.
 - **Relocatable AmigaHunk load**: `winuae_load` detects classic AmigaHunk executables, assigns contiguous load addresses, applies `RELOC32`, and writes relocated hunks before verification.
 - **Conditional breakpoints**: `winuae_breakpoint_conditional_wait` uses a normal software breakpoint plus server-side predicate checks on registers, custom registers, or exact memory bytes. The current WinUAE GDB stub does not expose native GDB-expression conditional breakpoints, so this helper is explicitly software-assisted.
@@ -194,6 +196,7 @@ There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “
 ### Technical notes
 
 - `winuae_machine_snapshot` returns JSON text and caps each optional RAM window at **16 KiB**; requests above that are truncated and marked in the response. It has been live-validated in this workspace against a visible WinUAE session, including CPU/custom capture, a truncated 16 KiB chip RAM window, and region-specific fast RAM errors without breaking the whole snapshot. RAM windows are read in 1 KiB chunks to avoid stub resets on large reads.
+- `winuae_postmortem_capture` is intended for postmortem analysis after `winuae_pause`, `winuae_wait_stop`, requesters, or test failures. Its GDB signal-to-exception mapping is heuristic, especially on plain 68000 targets, so treat it as a debugging aid rather than a perfect architectural exception decoder.
 - `winuae_bitmap_decode` supports 1–8 bitplanes, row-interleaved or plane-sequential layouts, and can derive palette from custom COLOR registers. Inline RGBA output is limited to **16384 pixels**; use PNG for larger images.
 - `winuae_memory_pattern_search` caps the scanned RAM range at **256 KiB**, the pattern at **8 KiB**, and the result list at **64** candidates to keep MCP responses bounded.
 - `winuae_load` now supports a practical subset of AmigaHunk (`HEADER`, `CODE`, `DATA`, `BSS`, `RELOC32`, `END`) for typical toolchain outputs. Unsupported hunk block types still fail fast.

@@ -44,6 +44,10 @@ import {
   normalizeConditionalBreakpointRequest,
 } from './conditional-breakpoint.js';
 import {
+  buildPostmortemReport,
+  renderPostmortemMarkdown,
+} from './postmortem.js';
+import {
   applyAutomationInputPatch,
   AUTOMATION_INPUT_SIZE,
   buildAutomationInputResponse,
@@ -853,6 +857,106 @@ const tools: Tool[] = [
       },
     },
   },
+  {
+    name: 'winuae_postmortem_capture',
+    description: 'Capture a postmortem bundle after a crash, requester, or suspicious stop: CPU registers, parsed stop reason, stack dump, disassembly around PC, and optional custom/chip snapshots.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stop_reply: {
+          type: 'string',
+          description: 'Optional raw stop reply from winuae_pause / winuae_wait_stop, such as S04 or T05thread:....',
+        },
+        stack_bytes: {
+          type: 'number',
+          description: 'Bytes to dump from A7/SP (default 128, max 1024).',
+          default: 128,
+        },
+        disasm_count: {
+          type: 'number',
+          description: 'Instructions/lines requested around PC from the monitor disassembler (default 12).',
+          default: 12,
+        },
+        include_custom: {
+          type: 'boolean',
+          description: 'Include current custom register snapshot (default true).',
+          default: true,
+        },
+        include_chip_window: {
+          type: 'boolean',
+          description: 'Include a bounded chip RAM window in the snapshot.',
+          default: false,
+        },
+        chip_window_address: {
+          type: ['string', 'number'],
+          description: 'Optional chip RAM window base address (default $000000).',
+        },
+        chip_window_bytes: {
+          type: 'number',
+          description: 'Chip RAM bytes to include when include_chip_window=true (default 1024).',
+          default: 1024,
+        },
+        markdown_file: {
+          type: 'string',
+          description: 'Optional host path where a Markdown summary should be written.',
+        },
+        json_file: {
+          type: 'string',
+          description: 'Optional host path where JSON should be written.',
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_postmortem_capture',
+    description: 'Capture a postmortem bundle from the current stopped state: registers, optional custom/custom-chip snapshot, disassembly around PC, stack dump from A7, and optional RAM window. Useful after crashes, requesters, or suspicious stops.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stop_reply: {
+          type: 'string',
+          description: 'Optional stop reply text already known by the caller.',
+        },
+        disasm_count: {
+          type: 'number',
+          description: 'Instructions to disassemble around PC (default: 16).',
+          default: 16,
+        },
+        stack_bytes: {
+          type: 'number',
+          description: 'Bytes to dump from A7 (default: 128).',
+          default: 128,
+        },
+        include_custom: {
+          type: 'boolean',
+          description: 'Include decoded custom registers in the bundle (default: true).',
+          default: true,
+        },
+        include_chip_window: {
+          type: 'boolean',
+          description: 'Include a bounded chip RAM window in the bundle (default: false).',
+          default: false,
+        },
+        chip_window_address: {
+          type: ['string', 'number'],
+          description: 'Optional chip RAM window address if include_chip_window=true.',
+        },
+        chip_window_bytes: {
+          type: 'number',
+          description: 'Optional chip RAM window size if include_chip_window=true. Max 16384 bytes.',
+          default: 0,
+        },
+        json_file: {
+          type: 'string',
+          description: 'Optional absolute host path for JSON output.',
+        },
+        markdown_file: {
+          type: 'string',
+          description: 'Optional absolute host path for Markdown output.',
+        },
+      },
+    },
+  },
 
   // Amiga hardware tools
   {
@@ -1448,6 +1552,12 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const fileData = readFileSync(absPath);
         const protocol = connection.getProtocol();
 
+        try {
+          await protocol.pause();
+        } catch {
+          // Some sessions are already paused after connect; ignore and proceed.
+        }
+
         const loadAddr = args.address !== undefined
           ? parseHexOrDecimal(args.address)
           : 0x4000;
@@ -1882,6 +1992,41 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         return { content: [{ type: 'text', text: `Paused (${stopReply})\n${formatRegisters(regs)}` }] };
       }
 
+      case 'winuae_postmortem_capture': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const report = await buildPostmortemReport({
+          protocol,
+          customRegs: CUSTOM_REGS,
+        }, {
+          stopReply: args.stop_reply ? String(args.stop_reply) : undefined,
+          stackBytes: args.stack_bytes !== undefined ? Number(args.stack_bytes) : undefined,
+          disasmCount: args.disasm_count !== undefined ? Number(args.disasm_count) : undefined,
+          includeCustom: args.include_custom !== false,
+          includeChipWindow: args.include_chip_window === true,
+          chipWindowAddress: args.chip_window_address !== undefined ? parseHexOrDecimal(args.chip_window_address) : undefined,
+          chipWindowBytes: args.chip_window_bytes !== undefined ? Number(args.chip_window_bytes) : undefined,
+        });
+        const markdown = renderPostmortemMarkdown(report);
+
+        const fs = await import('fs');
+        if (args.json_file) {
+          fs.writeFileSync(String(args.json_file), JSON.stringify(report, null, 2), 'utf8');
+        }
+        if (args.markdown_file) {
+          fs.writeFileSync(String(args.markdown_file), markdown, 'utf8');
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify({
+          message: 'Postmortem captured',
+          json_file: args.json_file ?? null,
+          markdown_file: args.markdown_file ?? null,
+          stop: report.stop ?? null,
+          pc: (report.cpu as { PC?: string } | undefined)?.PC ?? null,
+          a7: (report.cpu as { A7?: string } | undefined)?.A7 ?? null,
+        }, null, 2) }] };
+      }
+
       case 'winuae_custom_registers': {
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const protocol = connection.getProtocol();
@@ -2104,6 +2249,44 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const hexReply = await protocol.sendMonitorCommand(`disasm ${addr.toString(16)} ${count}`, 10000);
           const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
           return { content: [{ type: 'text', text: textReply }] };
+      }
+
+      case 'winuae_postmortem_capture': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const report = await buildPostmortemReport({
+          protocol,
+          customRegs: CUSTOM_REGS,
+        }, {
+          stopReply: args.stop_reply ? String(args.stop_reply) : undefined,
+          stackBytes: args.stack_bytes !== undefined ? Number(args.stack_bytes) : undefined,
+          disasmCount: args.disasm_count !== undefined ? Number(args.disasm_count) : undefined,
+          includeCustom: args.include_custom !== false,
+          includeChipWindow: args.include_chip_window === true,
+          chipWindowAddress: args.chip_window_address !== undefined ? parseHexOrDecimal(args.chip_window_address) : undefined,
+          chipWindowBytes: args.chip_window_bytes !== undefined ? Number(args.chip_window_bytes) : undefined,
+        });
+
+        const payload: Record<string, unknown> = {
+          report,
+        };
+
+        if (args.json_file || args.markdown_file) {
+          const fs = await import('fs');
+          const pathModule = await import('path');
+          if (args.json_file) {
+            const jsonPath = pathModule.resolve(String(args.json_file));
+            fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2), 'utf8');
+            payload.json_file = jsonPath;
+          }
+          if (args.markdown_file) {
+            const markdownPath = pathModule.resolve(String(args.markdown_file));
+            fs.writeFileSync(markdownPath, renderPostmortemMarkdown(report), 'utf8');
+            payload.markdown_file = markdownPath;
+          }
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
       }
 
       case 'winuae_exec_chunk': {

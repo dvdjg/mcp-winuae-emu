@@ -38,6 +38,9 @@ public static class WinUaeCaptureNative {
 
   [DllImport("user32.dll")]
   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+  [DllImport("user32.dll")]
+  public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, int nFlags);
 }
 "@
 
@@ -70,8 +73,19 @@ $width = [Math]::Max(1, $rect.Right - $rect.Left)
 $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
 $bitmap = New-Object System.Drawing.Bitmap($width, $height)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
-$method = 'screen_copy'
+$hdc = $graphics.GetHdc()
+try {
+  $printed = [WinUaeCaptureNative]::PrintWindow($hWnd, $hdc, 0)
+} finally {
+  $graphics.ReleaseHdc($hdc)
+}
+
+if ($printed) {
+  $method = 'printwindow'
+} else {
+  $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+  $method = 'screen_copy'
+}
 
 $outPath = '${quotedPath}'
 $bitmap.Save($outPath, [System.Drawing.Imaging.ImageFormat]::Png)

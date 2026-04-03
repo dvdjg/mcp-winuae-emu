@@ -5,6 +5,8 @@ const HUNK_CODE = 0x000003e9;
 const HUNK_DATA = 0x000003ea;
 const HUNK_BSS = 0x000003eb;
 const HUNK_RELOC32 = 0x000003ec;
+const HUNK_SYMBOL = 0x000003f0;
+const HUNK_DEBUG = 0x000003f1;
 const HUNK_END = 0x000003f2;
 
 interface ParsedHunk {
@@ -38,6 +40,32 @@ function readWord(buffer: Buffer, state: { offset: number }): number {
 
 function align4(value: number): number {
   return (value + 3) & ~3;
+}
+
+function skipHunkSymbolBlock(buffer: Buffer, state: { offset: number }): void {
+  while (true) {
+    const nameLongs = readWord(buffer, state);
+    if (nameLongs === 0) {
+      return;
+    }
+
+    const symbolNameBytes = nameLongs * 4;
+    if (state.offset + symbolNameBytes + 4 > buffer.length) {
+      throw new Error('Unexpected end of file while skipping HUNK_SYMBOL block');
+    }
+
+    state.offset += symbolNameBytes;
+    state.offset += 4; // symbol value
+  }
+}
+
+function skipSizedHunkBlock(buffer: Buffer, state: { offset: number }, label: string): void {
+  const longCount = readWord(buffer, state);
+  const byteCount = longCount * 4;
+  if (state.offset + byteCount > buffer.length) {
+    throw new Error(`Unexpected end of file while skipping ${label}`);
+  }
+  state.offset += byteCount;
 }
 
 export function isAmigaHunkExecutable(buffer: Buffer): boolean {
@@ -112,6 +140,14 @@ export function loadAmigaHunk(buffer: Buffer, loadAddress: number): LoadedAmigaH
           }
           parsed.relocs.push({ targetHunk, offsets });
         }
+        continue;
+      }
+      if (nextType === HUNK_SYMBOL) {
+        skipHunkSymbolBlock(buffer, state);
+        continue;
+      }
+      if (nextType === HUNK_DEBUG) {
+        skipSizedHunkBlock(buffer, state, 'HUNK_DEBUG');
         continue;
       }
       throw new Error(`Unsupported AmigaHunk secondary block ${hex32(nextType)}`);
