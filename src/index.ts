@@ -12,8 +12,45 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
-import { M68kRegisters, WatchpointType } from './gdb-protocol.js';
+import { SessionIdleAction, WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
+import { GdbProtocol, M68kRegisters, WatchpointType } from './gdb-protocol.js';
+import {
+  buildCpuSnapshot,
+  buildCustomRegisterSnapshot,
+  buildMachineSnapshot,
+  buildMemoryWindowErrorSnapshot,
+  buildMemoryWindowSnapshot,
+  CUSTOM_REGISTER_CHUNK_SIZE,
+  CUSTOM_REGISTER_SIZE,
+  readMemoryWindowChunked,
+  normalizeMemoryWindow,
+} from './machine-snapshot.js';
+import {
+  buildBitmapDecodeResponse,
+  decodePlanarBitmap,
+  encodePngRgba,
+  normalizeBitmapDecodeRequest,
+  rgbaToHex,
+} from './bitmap-decode.js';
+import { isAmigaHunkExecutable, loadAmigaHunk } from './amiga-hunk.js';
+import {
+  buildMemoryPatternSearchResponse,
+  normalizeMemoryPatternSearchRequest,
+  searchMemoryPattern,
+} from './memory-pattern-search.js';
+import {
+  buildConditionalBreakpointResponse,
+  evaluateConditionalBreakpoint,
+  normalizeConditionalBreakpointRequest,
+} from './conditional-breakpoint.js';
+import {
+  applyAutomationInputPatch,
+  AUTOMATION_INPUT_SIZE,
+  buildAutomationInputResponse,
+  resolveAutomationInputSymbolInfo,
+  resolveEnterDemoAddress,
+} from './amiga-automation-input.js';
+import { captureWinUAEWindow } from './winuae-window-capture.js';
 import * as path from 'path';
 
 // ─── Configuration from environment ──────────────────────────────────
@@ -30,6 +67,60 @@ const config: WinUAEConfig = {
 
 // Global connection instance
 let connection: WinUAEConnection | null = null;
+
+const CONNECTION_OPTIONAL_TOOLS = new Set([
+  'winuae_connect',
+  'winuae_connect_existing',
+  'winuae_disconnect',
+  'winuae_status',
+  'winuae_session_config',
+  'winuae_load',
+  'winuae_insert_disk',
+  'winuae_eject_disk',
+]);
+
+function getBaseConfigForArgs(args: Record<string, unknown>): WinUAEConfig {
+  const configFile =
+    args?.config_file && String(args.config_file).trim()
+      ? path.resolve(String(args.config_file).trim())
+      : config.configFile;
+  return { ...config, configFile };
+}
+
+function cloneConnectionState(source: WinUAEConnection, target: WinUAEConnection): void {
+  const info = source.getSessionInfo();
+  target.setSessionIdlePolicy(info.idleTimeoutMs, info.idleAction);
+  for (const [drive, filePath] of source.getFloppies()) {
+    target.setFloppy(drive, filePath);
+  }
+}
+
+async function tryAutoAttachForTool(name: string, args: Record<string, unknown>): Promise<void> {
+  if (CONNECTION_OPTIONAL_TOOLS.has(name) || connection?.connected) {
+    return;
+  }
+
+  const cfg = connection
+    ? {
+        winuaePath: connection.getSessionInfo().winuaePath,
+        configFile: connection.getSessionInfo().configFile,
+        gdbPort: connection.getSessionInfo().gdbPort,
+      }
+    : getBaseConfigForArgs(args);
+
+  const candidate = new WinUAEConnection(cfg);
+  if (connection) {
+    cloneConnectionState(connection, candidate);
+  }
+
+  try {
+    await candidate.connectExisting();
+    connection = candidate;
+    connection.markActivity(`auto_attach:${name}`);
+  } catch {
+    // Fall through; the tool-specific handler will raise the normal "Not connected" error.
+  }
+}
 
 // ─── Amiga Custom Register Name Table ────────────────────────────────
 
@@ -180,6 +271,25 @@ function formatRegisters(regs: M68kRegisters): string {
   return lines.join('\n');
 }
 
+async function readCustomRegisterData(protocol: GdbProtocol): Promise<{ data: Buffer; unreadableChunkOffsets: number[] }> {
+  const chunks: Buffer[] = [];
+  const unreadableChunkOffsets: number[] = [];
+
+  for (let off = 0; off < CUSTOM_REGISTER_SIZE; off += CUSTOM_REGISTER_CHUNK_SIZE) {
+    try {
+      chunks.push(await protocol.readMemory(0xDFF000 + off, CUSTOM_REGISTER_CHUNK_SIZE));
+    } catch {
+      unreadableChunkOffsets.push(off);
+      chunks.push(Buffer.alloc(CUSTOM_REGISTER_CHUNK_SIZE, 0));
+    }
+  }
+
+  return {
+    data: Buffer.concat(chunks),
+    unreadableChunkOffsets,
+  };
+}
+
 /**
  * Decode Copper list from raw memory
  */
@@ -267,6 +377,15 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Optional absolute path to a WinUAE .uae file (overrides WINUAE_CONFIG for this session).',
         },
+        idle_timeout_ms: {
+          type: 'number',
+          description: 'Optional reusable-session idle timeout in milliseconds. 0 disables auto-disconnect.',
+        },
+        idle_action: {
+          type: 'string',
+          enum: ['detach', 'shutdown'],
+          description: 'Optional idle action. detach leaves WinUAE running, shutdown closes the launched emulator process.',
+        },
       },
     },
   },
@@ -280,23 +399,58 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Ignored for hardware (emulator already running); reserved for future use / logging.',
         },
+        idle_timeout_ms: {
+          type: 'number',
+          description: 'Optional reusable-session idle timeout in milliseconds. 0 disables auto-disconnect.',
+        },
+        idle_action: {
+          type: 'string',
+          enum: ['detach', 'shutdown'],
+          description: 'Optional idle action. detach leaves WinUAE running, shutdown closes the launched emulator process if this MCP started it.',
+        },
       },
     },
   },
   {
     name: 'winuae_disconnect',
-    description: 'Disconnect from WinUAE and stop the emulator process',
+    description: 'Disconnect from WinUAE. By default also stops the launched emulator process; set stop_emulator=false to detach and leave the window running.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stop_emulator: {
+          type: 'boolean',
+          description: 'If false, only disconnect GDB and leave the emulator process running.',
+          default: true,
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_status',
+    description: 'Return JSON session status, health, tracked floppies, and reusable-session policy.',
     inputSchema: {
       type: 'object',
       properties: {},
     },
   },
   {
-    name: 'winuae_status',
-    description: 'Check if WinUAE is running and GDB connection is active',
+    name: 'winuae_session_config',
+    description: 'Configure reusable WinUAE session behavior. idle_timeout_ms=0 disables auto-disconnect. idle_action=detach leaves WinUAE running after idle expiry.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        idle_timeout_ms: {
+          type: 'number',
+          description: 'Idle timeout in milliseconds before automatic disconnect. 0 disables the timer.',
+          default: 0,
+        },
+        idle_action: {
+          type: 'string',
+          enum: ['detach', 'shutdown'],
+          description: 'detach leaves WinUAE running and only drops GDB; shutdown also closes the launched emulator process.',
+          default: 'detach',
+        },
+      },
     },
   },
 
@@ -531,6 +685,80 @@ const tools: Tool[] = [
       required: ['address'],
     },
   },
+  {
+    name: 'winuae_breakpoint_conditional_wait',
+    description: 'Software-assisted conditional breakpoint helper. Sets a breakpoint at an address, continues execution, and only returns when all requested register/custom/memory conditions match on a stop. This is not native stub-side conditional breakpoint support.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Address to break at while evaluating conditions.',
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Total timeout budget in milliseconds across all hits (default: 30000).',
+          default: 30000,
+        },
+        max_hits: {
+          type: 'number',
+          description: 'Maximum breakpoint hits to inspect before returning unmatched (default: 32).',
+          default: 32,
+        },
+        auto_clear: {
+          type: 'boolean',
+          description: 'Clear the temporary breakpoint before returning (default: true).',
+          default: true,
+        },
+        register_equals: {
+          type: 'object',
+          description: 'Map of CPU register names to exact values, for example { "D0": "$1", "PC": "$4000" }.',
+          additionalProperties: {
+            type: ['string', 'number'],
+          },
+        },
+        register_mask_equals: {
+          type: 'array',
+          description: 'Array of masked register comparisons. Each entry checks (register & mask) === value.',
+          items: {
+            type: 'object',
+            properties: {
+              register: { type: 'string' },
+              mask: { type: ['string', 'number'] },
+              value: { type: ['string', 'number'] },
+            },
+            required: ['register', 'mask', 'value'],
+          },
+        },
+        memory_equals: {
+          type: 'array',
+          description: 'Array of exact memory byte checks at stop time.',
+          items: {
+            type: 'object',
+            properties: {
+              address: { type: ['string', 'number'] },
+              value_hex: { type: 'string' },
+            },
+            required: ['address', 'value_hex'],
+          },
+        },
+        custom_equals: {
+          type: 'array',
+          description: 'Array of exact custom register checks. Use either name (for example DMACON) or offset (for example $096).',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              offset: { type: ['string', 'number'] },
+              value: { type: ['string', 'number'] },
+            },
+            required: ['value'],
+          },
+        },
+      },
+      required: ['address'],
+    },
+  },
 
   // Watchpoints
   {
@@ -633,6 +861,141 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'winuae_machine_snapshot',
+    description: 'Return a structured machine snapshot as JSON text: CPU registers, Amiga custom registers, and optional bounded RAM windows. Memory windows are opt-in and each is capped at 16384 bytes to keep MCP responses manageable.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_cpu: {
+          type: 'boolean',
+          description: 'Include CPU registers in the snapshot (default: true).',
+          default: true,
+        },
+        include_custom: {
+          type: 'boolean',
+          description: 'Include Amiga custom registers in the snapshot (default: true).',
+          default: true,
+        },
+        chip_ram_address: {
+          type: ['string', 'number'],
+          description: 'Optional chip RAM window base address (default: $000000 if chip_ram_bytes > 0).',
+        },
+        chip_ram_bytes: {
+          type: 'number',
+          description: 'Optional chip RAM bytes to include. 0 disables the window. Max 16384 bytes.',
+          default: 0,
+        },
+        fast_ram_address: {
+          type: ['string', 'number'],
+          description: 'Optional fast RAM window base address (default: $00200000 if fast_ram_bytes > 0).',
+        },
+        fast_ram_bytes: {
+          type: 'number',
+          description: 'Optional fast RAM bytes to include. 0 disables the window. Max 16384 bytes.',
+          default: 0,
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_bitmap_decode',
+    description: 'Decode a planar bitmap from Amiga memory to PNG and optional inline RGBA hex. Supports 4/5/6 planes, interleaved or non-interleaved layout, explicit width/height, and palette from arguments or current custom registers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Base address of the bitmap data in Amiga memory.',
+        },
+        width: {
+          type: 'number',
+          description: 'Bitmap width in pixels.',
+        },
+        height: {
+          type: 'number',
+          description: 'Bitmap height in pixels.',
+        },
+        depth: {
+          type: 'number',
+          description: 'Bitplane depth. MVP supports 4, 5, or 6; implementation accepts 1-6.',
+        },
+        row_bytes: {
+          type: 'number',
+          description: 'Bytes per row per bitplane. Default: ceil(width / 16) * 2.',
+        },
+        layout: {
+          type: 'string',
+          enum: ['interleaved', 'planar'],
+          description: 'Bitplane layout. interleaved=row-by-row per plane, planar=whole plane blocks.',
+          default: 'interleaved',
+        },
+        color_mode: {
+          type: 'string',
+          enum: ['auto', 'direct', 'ehb'],
+          description: 'Palette interpretation. auto chooses EHB for 6-plane decode when palette is derived from custom registers.',
+          default: 'auto',
+        },
+        filepath: {
+          type: 'string',
+          description: 'Optional full host path for the PNG output.',
+        },
+        filename: {
+          type: 'string',
+          description: 'Optional basename for the PNG output in the system temp directory.',
+        },
+        palette: {
+          type: 'array',
+          description: 'Optional palette entries as #RRGGBB, #RGB, $RGB, or 0xRGB strings. If omitted, COLOR00-31 from current custom registers is used.',
+          items: {
+            type: 'string',
+          },
+        },
+        include_rgba_hex: {
+          type: 'boolean',
+          description: 'Include inline RGBA hex in the response for small images.',
+          default: false,
+        },
+      },
+      required: ['address', 'width', 'height', 'depth'],
+    },
+  },
+  {
+    name: 'winuae_memory_pattern_search',
+    description: 'Search RAM for an exact byte pattern and optionally score repeated matches using a configurable stride. Useful for ILBM/BMHD headers, bitmap row signatures, and repeated structures in memory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: ['string', 'number'],
+          description: 'Base address of the RAM range to search.',
+        },
+        length: {
+          type: 'number',
+          description: 'Number of bytes to scan. Limited to 262144 bytes.',
+        },
+        pattern_hex: {
+          type: 'string',
+          description: 'Exact byte pattern as hex string (spaces allowed).',
+        },
+        stride_bytes: {
+          type: 'number',
+          description: 'Optional stride between repeated pattern rows/records.',
+        },
+        repeat_count: {
+          type: 'number',
+          description: 'Expected number of repeated matches for stride scoring. Default: 1.',
+          default: 1,
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum candidates to return. Default: 16, capped at 64.',
+          default: 16,
+        },
+      },
+      required: ['address', 'length', 'pattern_hex'],
     },
   },
   {
@@ -758,6 +1121,96 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'winuae_amiga_input_state',
+    description: 'Read the Cursor-Amiga-C automation input buffer (`g_automation_input`) from Amiga memory and decode it as mouse/keyboard/joystick state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        elf_file: {
+          type: 'string',
+          description: 'Path to the Amiga ELF used to resolve g_automation_input if automation_address is omitted.',
+        },
+        automation_address: {
+          type: ['string', 'number'],
+          description: 'Explicit Amiga memory address of g_automation_input. Overrides elf_file.',
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_amiga_input_set',
+    description: 'Write the Cursor-Amiga-C automation input buffer (`g_automation_input`) so mouse, key and joystick input go directly into the running Amiga app. Supports interpolated mouse movement by screen coordinates.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        elf_file: {
+          type: 'string',
+          description: 'Path to the Amiga ELF used to resolve g_automation_input if automation_address is omitted.',
+        },
+        automation_address: {
+          type: ['string', 'number'],
+          description: 'Explicit Amiga memory address of g_automation_input. Overrides elf_file.',
+        },
+        preserve_existing: {
+          type: 'boolean',
+          description: 'Read the current 20-byte buffer and only patch requested fields (default true).',
+          default: true,
+        },
+        enabled: { type: 'boolean' },
+        mouse_left: { type: 'boolean' },
+        mouse_right: { type: 'boolean' },
+        mouse_x: { type: 'number', description: 'Target mouse X in Amiga screen coordinates (0..319).' },
+        mouse_y: { type: 'number', description: 'Target mouse Y in Amiga screen coordinates (0..255).' },
+        move_steps: {
+          type: 'number',
+          description: 'If > 1 and mouse_x/y are provided, interpolate cursor movement across this many writes.',
+          default: 1,
+        },
+        move_delay_ms: {
+          type: 'number',
+          description: 'Delay between interpolated mouse writes (default 0).',
+          default: 0,
+        },
+        joy0_fire: { type: 'boolean' },
+        joy0_up: { type: 'boolean' },
+        joy0_down: { type: 'boolean' },
+        joy0_left: { type: 'boolean' },
+        joy0_right: { type: 'boolean' },
+        joy1_fire: { type: 'boolean' },
+        joy1_up: { type: 'boolean' },
+        joy1_down: { type: 'boolean' },
+        joy1_left: { type: 'boolean' },
+        joy1_right: { type: 'boolean' },
+        keycode: {
+          type: 'number',
+          description: 'Single raw keycode to inject via the automation buffer (0x00..0x7F).',
+        },
+        clear_key: {
+          type: 'boolean',
+          description: 'Set the automation key slot back to 0xFF (no key pending).',
+          default: false,
+        },
+      },
+    },
+  },
+  {
+    name: 'winuae_amiga_enter_demo',
+    description: 'Set `g_automation_enter_demo=1` inside Cursor-Amiga-C so the running app enters demo/effect flow through its software automation path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        elf_file: {
+          type: 'string',
+          description: 'Path to the Amiga ELF used to resolve g_automation_enter_demo if enter_demo_address is omitted.',
+        },
+        enter_demo_address: {
+          type: ['string', 'number'],
+          description: 'Explicit Amiga memory address of g_automation_enter_demo. Overrides elf_file.',
+        },
+      },
+    },
+  },
+  {
     name: 'winuae_run_program',
     description: 'Load an Amiga executable into memory, set PC to entry, and start execution.',
     inputSchema: {
@@ -811,7 +1264,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_screenshot',
-    description: 'Capture emulated Amiga display to PNG via WinUAE monitor. Use filepath for a full host path, or filename (basename only, saved under system temp). If neither given, uses winuae-screen-{timestamp}.png in temp.',
+    description: 'Capture the Amiga display to PNG. Default mode tries WinUAE monitor screenshot first and falls back to capturing the visible WinUAE host window if needed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -822,6 +1275,12 @@ const tools: Tool[] = [
         filename: {
           type: 'string',
           description: 'Basename only; combined with system temp dir if not absolute.',
+        },
+        capture_mode: {
+          type: 'string',
+          enum: ['auto', 'monitor', 'host_window'],
+          description: 'auto=try WinUAE monitor first then host window fallback, monitor=only qRcmd screenshot, host_window=only capture the visible WinUAE window.',
+          default: 'auto',
         },
       },
     },
@@ -863,48 +1322,101 @@ const tools: Tool[] = [
 
 async function handleToolCall(name: string, args: any): Promise<{ content: Array<{ type: string; text?: string }> }> {
   try {
+    const normalizedArgs = (args ?? {}) as Record<string, unknown>;
+
+    await tryAutoAttachForTool(name, normalizedArgs);
+
+    if (connection?.connected && !CONNECTION_OPTIONAL_TOOLS.has(name)) {
+      connection.markActivity(name);
+    }
+
     switch (name) {
       case 'winuae_connect': {
         if (connection?.connected) {
-          return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
+          connection.markActivity('connect_reuse');
+          return { content: [{ type: 'text', text: JSON.stringify({
+            message: 'Already connected to WinUAE',
+            session: connection.getSessionInfo(),
+          }, null, 2) }] };
         }
-        const cfg: WinUAEConfig =
-          args?.config_file && String(args.config_file).trim()
-            ? { ...config, configFile: path.resolve(String(args.config_file).trim()) }
-            : config;
+        const cfg: WinUAEConfig = getBaseConfigForArgs(normalizedArgs);
         connection = new WinUAEConnection(cfg);
+        if (args?.idle_timeout_ms !== undefined || args?.idle_action !== undefined) {
+          connection.setSessionIdlePolicy(
+            Number(args?.idle_timeout_ms ?? 0),
+            args?.idle_action as SessionIdleAction | undefined
+          );
+        }
         const statusMsg = await connection.connectSmart();
-        return { content: [{ type: 'text', text: statusMsg }] };
+        return { content: [{ type: 'text', text: JSON.stringify({
+          message: statusMsg,
+          session: connection.getSessionInfo(),
+        }, null, 2) }] };
       }
 
       case 'winuae_connect_existing': {
         if (connection?.connected) {
-          return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
+          connection.markActivity('connect_existing_reuse');
+          return { content: [{ type: 'text', text: JSON.stringify({
+            message: 'Already connected to WinUAE',
+            session: connection.getSessionInfo(),
+          }, null, 2) }] };
         }
-        const cfgEx: WinUAEConfig =
-          args?.config_file && String(args.config_file).trim()
-            ? { ...config, configFile: path.resolve(String(args.config_file).trim()) }
-            : config;
+        const cfgEx: WinUAEConfig = getBaseConfigForArgs(normalizedArgs);
         connection = new WinUAEConnection(cfgEx);
+        if (args?.idle_timeout_ms !== undefined || args?.idle_action !== undefined) {
+          connection.setSessionIdlePolicy(
+            Number(args?.idle_timeout_ms ?? 0),
+            args?.idle_action as SessionIdleAction | undefined
+          );
+        }
         await connection.connectExisting();
-        return { content: [{ type: 'text', text: `Connected to existing WinUAE GDB server on port ${config.gdbPort}. Do not call winuae_load (program already running).` }] };
+        return { content: [{ type: 'text', text: JSON.stringify({
+          message: `Connected to existing WinUAE GDB server on port ${config.gdbPort}. Do not call winuae_load (program already running).`,
+          session: connection.getSessionInfo(),
+        }, null, 2) }] };
       }
 
       case 'winuae_disconnect': {
-        if (!connection?.connected) {
+        if (!connection) {
           return { content: [{ type: 'text', text: 'Not connected to WinUAE' }] };
         }
-        await connection.disconnect();
+        const stopEmulator = args?.stop_emulator !== false;
+        await connection.disconnect(stopEmulator);
         connection = null;
-        return { content: [{ type: 'text', text: 'Disconnected from WinUAE' }] };
+        return { content: [{ type: 'text', text: stopEmulator ? 'Disconnected from WinUAE and stopped the emulator process' : 'Disconnected from WinUAE but left the emulator process running' }] };
       }
 
       case 'winuae_status': {
-        if (!connection?.connected) {
-          return { content: [{ type: 'text', text: 'Not connected' }] };
+        if (!connection) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            connected: false,
+            trackedProcessRunning: false,
+            message: 'No MCP WinUAE session has been created in this server process yet.',
+          }, null, 2) }] };
         }
         const healthy = await connection.healthCheck();
-        return { content: [{ type: 'text', text: healthy ? 'Connected and responsive' : 'Connected but not responding' }] };
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ...connection.getSessionInfo(),
+          healthy,
+          floppies: Object.fromEntries(connection.getFloppies()),
+          emulatorVisible: process.env.WINUAE_HEADLESS !== '1',
+        }, null, 2) }] };
+      }
+
+      case 'winuae_session_config': {
+        if (!connection) {
+          connection = new WinUAEConnection(config);
+        }
+        const current = connection.getSessionInfo();
+        connection.setSessionIdlePolicy(
+          Math.max(0, Number(args?.idle_timeout_ms ?? current.idleTimeoutMs)),
+          (args?.idle_action as SessionIdleAction | undefined) ?? current.idleAction
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({
+          message: 'WinUAE session policy updated',
+          session: connection.getSessionInfo(),
+        }, null, 2) }] };
       }
 
       case 'winuae_load': {
@@ -940,11 +1452,30 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           ? parseHexOrDecimal(args.address)
           : 0x4000;
 
-        if (fileData.length >= 4) {
-          const magic = fileData.readUInt32BE(0);
-          if (magic === 0x000003F3) {
-            console.error(`[WinUAE] Detected hunk executable: ${absPath}`);
+        if (isAmigaHunkExecutable(fileData)) {
+          const program = loadAmigaHunk(fileData, loadAddr);
+          console.error(`[WinUAE] Detected AmigaHunk executable: ${absPath}`);
+          for (const hunk of program.hunks) {
+            console.error(`[WinUAE] Loading hunk ${hunk.type} ${hunk.data.length} bytes to ${hex32(hunk.baseAddress)}...`);
+            await protocol.writeMemory(hunk.baseAddress, hunk.data);
           }
+
+          const verifyLen = Math.min(16, program.hunks[0].data.length);
+          const readBack = await protocol.readMemory(program.hunks[0].baseAddress, verifyLen);
+          const match = readBack.equals(program.hunks[0].data.subarray(0, verifyLen));
+          const verifyMsg = match
+            ? 'Verify OK (first relocated bytes match)'
+            : `VERIFY MISMATCH! Expected: ${program.hunks[0].data.subarray(0, verifyLen).toString('hex')} Got: ${readBack.toString('hex')}`;
+
+          const hunkSummary = program.hunks
+            .map((hunk, index) => `Hunk ${index}: ${hunk.type} ${hex32(hunk.baseAddress)} (${hunk.sizeBytes} bytes)`)
+            .join('\n');
+          return {
+            content: [{
+              type: 'text',
+              text: `Loaded relocatable AmigaHunk program from ${absPath}\nEntry=${hex32(program.entryAddress)} Total=${program.totalBytes} bytes\n${hunkSummary}\n${verifyMsg}`,
+            }],
+          };
         }
 
         console.error(`[WinUAE] Loading ${fileData.length} bytes to ${hex32(loadAddr)} (chunked)...`);
@@ -1012,6 +1543,18 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             await protocol.sendMonitorCommand(`df${drive} insert "${absPath}"`, 15000);
             return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: (hot-swap, no restart).` }] };
           } catch {
+            if (!connection.canAutoRestartManagedProcess()) {
+              const session = connection.getSessionInfo();
+              return {
+                content: [{
+                  type: 'text',
+                  text:
+                    `Hot-swap insert for DF${drive}: failed in the current attached session, and MCP did not restart it because this emulator was not launched by the current MCP connection.\n` +
+                    `Requested disk remains tracked for the next managed launch: ${absPath}\n` +
+                    `Session mode=${session.connectionMode} trackedProcessRunning=${session.trackedProcessRunning}`,
+                }],
+              };
+            }
             const statusMsg = await connection.restart();
             return { content: [{ type: 'text', text: `Inserted ${absPath} into DF${drive}: and restarted.\n${statusMsg}` }] };
           }
@@ -1035,6 +1578,18 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             await protocol.sendMonitorCommand(`df${drive} eject`, 5000);
             return { content: [{ type: 'text', text: `Ejected DF${drive}: (hot-swap, no restart).` }] };
           } catch {
+            if (!connection.canAutoRestartManagedProcess()) {
+              const session = connection.getSessionInfo();
+              return {
+                content: [{
+                  type: 'text',
+                  text:
+                    `Hot-swap eject for DF${drive}: failed in the current attached session, and MCP did not restart it because this emulator was not launched by the current MCP connection.\n` +
+                    `Requested eject remains tracked for the next managed launch.\n` +
+                    `Session mode=${session.connectionMode} trackedProcessRunning=${session.trackedProcessRunning}`,
+                }],
+              };
+            }
             const statusMsg = await connection.restart();
             return { content: [{ type: 'text', text: `Ejected DF${drive}: and restarted.\n${statusMsg}` }] };
           }
@@ -1178,6 +1733,100 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         return { content: [{ type: 'text', text: `Breakpoint cleared at ${hex32(addr)}` }] };
       }
 
+      case 'winuae_breakpoint_conditional_wait': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const request = normalizeConditionalBreakpointRequest(args as Record<string, unknown>, CUSTOM_REGS);
+        let hits = 0;
+        let breakpointCleared = false;
+        const startedAt = Date.now();
+        let responsePayload: Record<string, unknown> | null = null;
+
+        await protocol.setBreakpoint(request.address);
+
+        try {
+          while (hits < request.maxHits) {
+            const remaining = request.timeoutMs - (Date.now() - startedAt);
+            if (remaining <= 0) {
+              responsePayload = buildConditionalBreakpointResponse({
+                request,
+                hits,
+                matched: false,
+                timedOut: true,
+                breakpointCleared,
+              });
+              break;
+            }
+
+            await protocol.continue();
+            const stopReply = await protocol.waitForStop(remaining);
+            const registers = await protocol.readRegisters();
+            hits += 1;
+
+            let customData: Buffer | undefined;
+            if (request.customEquals.length > 0) {
+              customData = (await readCustomRegisterData(protocol)).data;
+            }
+
+            let memoryByAddress: Map<number, Buffer> | undefined;
+            if (request.memoryEquals.length > 0) {
+              memoryByAddress = new Map<number, Buffer>();
+              for (const condition of request.memoryEquals) {
+                memoryByAddress.set(
+                  condition.address,
+                  await protocol.readMemory(condition.address, condition.value.length)
+                );
+              }
+            }
+
+            const evaluation = evaluateConditionalBreakpoint(request, {
+              registers,
+              customData,
+              memoryByAddress,
+            });
+
+            if (evaluation.matched) {
+              responsePayload = buildConditionalBreakpointResponse({
+                request,
+                hits,
+                matched: true,
+                stopReply,
+                breakpointCleared,
+                registers,
+                evaluation,
+              });
+              break;
+            }
+          }
+
+          if (!responsePayload) {
+            const registers = await protocol.readRegisters();
+            responsePayload = buildConditionalBreakpointResponse({
+              request,
+              hits,
+              matched: false,
+              breakpointCleared,
+              registers,
+            });
+          }
+        } finally {
+          if (request.autoClear) {
+            try {
+              await protocol.clearBreakpoint(request.address);
+              breakpointCleared = true;
+            } catch {
+              breakpointCleared = false;
+            }
+          }
+        }
+
+        if (responsePayload) {
+          (responsePayload.breakpoint as { address: string; auto_cleared: boolean }).auto_cleared = breakpointCleared;
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(responsePayload, null, 2) }] };
+      }
+
       case 'winuae_watchpoint_set': {
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const addr = parseHexOrDecimal(args.address);
@@ -1236,16 +1885,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
       case 'winuae_custom_registers': {
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
         const protocol = connection.getProtocol();
-        // Read in 64-byte chunks; some ranges (ECS/AGA regs on OCS) may fail
-        const chunks: Buffer[] = [];
-        for (let off = 0; off < 0x200; off += 0x40) {
-          try {
-            chunks.push(await protocol.readMemory(0xDFF000 + off, 0x40));
-          } catch {
-            chunks.push(Buffer.alloc(0x40, 0)); // fill unreadable ranges with zeros
-          }
-        }
-        const data = Buffer.concat(chunks);
+        const { data } = await readCustomRegisterData(protocol);
 
         const lines: string[] = ['Amiga Custom Registers ($DFF000-$DFF1FE):'];
         for (let offset = 0; offset < 0x200; offset += 2) {
@@ -1256,6 +1896,131 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           }
         }
         return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      case 'winuae_machine_snapshot': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const snapshot = buildMachineSnapshot({});
+
+        if (args.include_cpu !== false) {
+          snapshot.cpu = buildCpuSnapshot(await protocol.readRegisters());
+        }
+
+        if (args.include_custom !== false) {
+          const { data, unreadableChunkOffsets } = await readCustomRegisterData(protocol);
+          snapshot.custom = buildCustomRegisterSnapshot(data, CUSTOM_REGS, unreadableChunkOffsets);
+        }
+
+        const chipWindow = normalizeMemoryWindow({
+          address: args.chip_ram_address !== undefined ? parseHexOrDecimal(args.chip_ram_address) : undefined,
+          bytes: args.chip_ram_bytes,
+        }, 0x000000);
+        const fastWindow = normalizeMemoryWindow({
+          address: args.fast_ram_address !== undefined ? parseHexOrDecimal(args.fast_ram_address) : undefined,
+          bytes: args.fast_ram_bytes,
+        }, 0x200000);
+
+        if (chipWindow || fastWindow) {
+          snapshot.memory = {};
+        }
+
+        if (chipWindow) {
+          try {
+            const data = await readMemoryWindowChunked(protocol, chipWindow);
+            snapshot.memory!.chip = buildMemoryWindowSnapshot(chipWindow, data);
+          } catch (error) {
+            snapshot.memory!.chip = buildMemoryWindowErrorSnapshot(chipWindow, error);
+          }
+        }
+
+        if (fastWindow) {
+          try {
+            const data = await readMemoryWindowChunked(protocol, fastWindow);
+            snapshot.memory!.fast = buildMemoryWindowSnapshot(fastWindow, data);
+          } catch (error) {
+            snapshot.memory!.fast = buildMemoryWindowErrorSnapshot(fastWindow, error);
+          }
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }] };
+      }
+
+      case 'winuae_bitmap_decode': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const addr = parseHexOrDecimal(args.address);
+        const request = normalizeBitmapDecodeRequest({
+          width: Number(args.width),
+          height: Number(args.height),
+          depth: Number(args.bitplanes),
+          rowBytes: args.row_bytes,
+          layout: args.interleaved === false ? 'planar' : 'interleaved',
+          colorMode: args.extra_half_brite === true ? 'ehb' : 'auto',
+          palette: args.palette,
+        });
+        const outputFormat = args.output_format ?? 'png';
+        const bitmapData = await protocol.readMemory(addr, request.bytesToRead);
+
+        let customSnapshot;
+        if ((args.use_custom_palette ?? true) && (!args.palette || args.palette.length === 0)) {
+          const { data, unreadableChunkOffsets } = await readCustomRegisterData(protocol);
+          customSnapshot = buildCustomRegisterSnapshot(data, CUSTOM_REGS, unreadableChunkOffsets);
+        }
+
+        const decoded = decodePlanarBitmap(bitmapData, {
+          width: request.width,
+          height: request.height,
+          depth: request.depth,
+          rowBytes: request.rowBytes,
+          layout: request.layout,
+          colorMode: request.colorMode,
+        }, customSnapshot, args.palette);
+
+        if (outputFormat === 'rgba') {
+          const rgbaHex = rgbaToHex(decoded.rgba);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, undefined, rgbaHex), null, 2),
+            }],
+          };
+        } else {
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+          const fileName = args.filepath ?? `winuae-bitmap-${timestamp}.png`;
+          const { resolve } = await import('path');
+          const os = await import('os');
+          const fs = await import('fs');
+          const outputPath = path.isAbsolute(fileName) ? resolve(fileName) : path.join(os.tmpdir(), fileName);
+          fs.writeFileSync(outputPath, encodePngRgba(decoded.width, decoded.height, decoded.rgba));
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, outputPath), null, 2),
+            }],
+          };
+        }
+      }
+
+      case 'winuae_memory_pattern_search': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const request = normalizeMemoryPatternSearchRequest({
+          address: parseHexOrDecimal(args.address),
+          length: Number(args.length),
+          patternHex: String(args.pattern_hex),
+          strideBytes: args.stride_bytes,
+          repeatCount: args.repeat_count,
+          maxResults: args.max_results,
+        });
+        const data = await protocol.readMemory(request.address, request.length);
+        const candidates = searchMemoryPattern(data, request);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(buildMemoryPatternSearchResponse(request, candidates), null, 2),
+          }],
+        };
       }
 
       case 'winuae_copper_disassemble': {
@@ -1285,11 +2050,50 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
         const filename = args.filename ?? args.filepath ?? `winuae-screen-${timestamp}.png`;
         const filepath = path.isAbsolute(filename) ? resolve(filename) : path.join(os.tmpdir(), filename);
-        const winPath = filepath.replace(/\//g, '\\');
+        const captureMode = String(args.capture_mode ?? 'auto');
         const protocol = connection.getProtocol();
-        const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, 15000);
-        const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
-        return { content: [{ type: 'text', text: `Screenshot saved: ${textReply}\nFile: ${filepath}` }] };
+        const sessionInfo = connection.getSessionInfo();
+        let monitorError: string | null = null;
+
+        if (captureMode !== 'host_window') {
+          try {
+            const winPath = filepath.replace(/\//g, '\\');
+            const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, 15000);
+            const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  file: filepath,
+                  capture_mode: 'monitor',
+                  reply: textReply,
+                }, null, 2),
+              }],
+            };
+          } catch (error) {
+            monitorError = error instanceof Error ? error.message : String(error);
+            if (captureMode === 'monitor') {
+              throw error;
+            }
+          }
+        }
+
+        const windowCapture = captureWinUAEWindow(filepath, sessionInfo.trackedProcessId ?? undefined);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              file: filepath,
+              capture_mode: 'host_window',
+              monitor_error: monitorError,
+              process_id: windowCapture.processId,
+              method: windowCapture.method,
+              width: windowCapture.width,
+              height: windowCapture.height,
+              title: windowCapture.title,
+            }, null, 2),
+          }],
+        };
       }
 
       case 'winuae_disassemble_full': {
@@ -1409,6 +2213,82 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           return { content: [{ type: 'text', text: `Mouse button ${button} ${st ? 'press' : 'release'}` }] };
         }
         throw new Error(`Invalid mode: ${mode}`);
+      }
+
+      case 'winuae_amiga_input_state': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const symbolInfo = resolveAutomationInputSymbolInfo(args as Record<string, unknown>);
+        const address = symbolInfo.kind === 'pointer'
+          ? (await protocol.readMemory(symbolInfo.symbolAddress, 4)).readUInt32BE(0)
+          : symbolInfo.symbolAddress;
+        const buffer = await protocol.readMemory(address, AUTOMATION_INPUT_SIZE);
+        return { content: [{ type: 'text', text: JSON.stringify(buildAutomationInputResponse(address, buffer), null, 2) }] };
+      }
+
+      case 'winuae_amiga_input_set': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const symbolInfo = resolveAutomationInputSymbolInfo(args as Record<string, unknown>);
+        const address = symbolInfo.kind === 'pointer'
+          ? (await protocol.readMemory(symbolInfo.symbolAddress, 4)).readUInt32BE(0)
+          : symbolInfo.symbolAddress;
+        const preserveExisting = args.preserve_existing !== false;
+        const steps = Math.max(1, Number(args.move_steps ?? 1));
+        const delayMs = Math.max(0, Number(args.move_delay_ms ?? 0));
+        const wantsInterpolatedMove = steps > 1 && args.mouse_x !== undefined && args.mouse_y !== undefined;
+
+        let buffer = preserveExisting || wantsInterpolatedMove
+          ? await protocol.readMemory(address, AUTOMATION_INPUT_SIZE)
+          : Buffer.alloc(AUTOMATION_INPUT_SIZE, 0x00);
+
+        if (!preserveExisting && !wantsInterpolatedMove) {
+          buffer[18] = 0xFF;
+        }
+
+        if (wantsInterpolatedMove) {
+          const origin = Buffer.from(buffer);
+          const startState = buildAutomationInputResponse(address, origin).state as {
+            mouseX: number;
+            mouseY: number;
+          };
+          const targetX = Number(args.mouse_x);
+          const targetY = Number(args.mouse_y);
+
+          for (let step = 1; step <= steps; step++) {
+            const intermediate = Buffer.from(origin);
+            const mouseX = Math.round(startState.mouseX + ((targetX - startState.mouseX) * step) / steps);
+            const mouseY = Math.round(startState.mouseY + ((targetY - startState.mouseY) * step) / steps);
+            applyAutomationInputPatch(intermediate, {
+              ...args,
+              mouse_x: mouseX,
+              mouse_y: mouseY,
+            } as Record<string, unknown>);
+            await protocol.writeMemory(address, intermediate);
+            buffer = intermediate;
+            if (delayMs > 0 && step < steps) {
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+          }
+        } else {
+          buffer = applyAutomationInputPatch(buffer, args as Record<string, unknown>);
+          await protocol.writeMemory(address, buffer);
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(buildAutomationInputResponse(address, buffer), null, 2) }] };
+      }
+
+      case 'winuae_amiga_enter_demo': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const address = resolveEnterDemoAddress(args as Record<string, unknown>);
+        const value = Buffer.from([0x01, 0x00, 0x00, 0x00]);
+        await protocol.writeMemory(address, value);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          address: hex32(address),
+          value_hex: value.toString('hex').toUpperCase(),
+          note: 'g_automation_enter_demo set to 1 (little-endian int).',
+        }, null, 2) }] };
       }
 
       default:

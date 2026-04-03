@@ -9,6 +9,15 @@
   },
   "scripts": {
     "build": "tsc",
+    "test:adf-matrix": "npm run build && node scripts/a-mcp-01-matrix.mjs",
+    "test:amiga-input": "node dist/amiga-automation-input-selftest.js",
+    "test:conditional-breakpoint": "node dist/conditional-breakpoint-selftest.js",
+    "test:hunk": "node dist/amiga-hunk-selftest.js",
+    "test:bitmap": "node dist/bitmap-decode-selftest.js",
+    "test:snapshot-live": "npm run build && node scripts/a-mcp-02-live.mjs",
+    "test:pattern": "node dist/memory-pattern-search-selftest.js",
+    "test:session": "node dist/winuae-session-selftest.js",
+    "test:snapshot": "node dist/machine-snapshot-selftest.js",
     "watch": "tsc --watch",
     "prepare": "npm run build"
   },

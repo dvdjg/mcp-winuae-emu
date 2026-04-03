@@ -25,6 +25,8 @@ export interface WinUAEConfig {
   gdbPort: number;
 }
 
+export type SessionIdleAction = 'detach' | 'shutdown';
+
 export class WinUAEConnection {
   private config: WinUAEConfig;
   private process: ChildProcess | null = null;
@@ -32,6 +34,13 @@ export class WinUAEConnection {
   private isConnected = false;
   private logFilePath: string | null = null;
   private floppies: Map<number, string> = new Map();
+  private sessionIdleTimeoutMs = Math.max(0, parseInt(process.env.WINUAE_SESSION_IDLE_TIMEOUT_MS || '0', 10));
+  private sessionIdleAction: SessionIdleAction =
+    process.env.WINUAE_SESSION_IDLE_ACTION === 'shutdown' ? 'shutdown' : 'detach';
+  private sessionIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastActivityAt: Date | null = null;
+  private lastActivityReason = 'never';
+  private connectionMode: 'launched' | 'attached' | 'disconnected' = 'disconnected';
 
   constructor(config: WinUAEConfig) {
     this.config = config;
@@ -163,22 +172,26 @@ export class WinUAEConnection {
     trace(`Launching ${exePath} ${args.join(' ')}`);
     trace(`GDB port: ${this.config.gdbPort}, log: ${this.logFilePath}`);
     
-    this.process = spawn(exePath, args, {
+    const spawnedProcess = spawn(exePath, args, {
       stdio: ['ignore', logFd, logFd],
       detached: false,
       cwd: path.resolve(this.config.winuaePath),
       windowsHide: headless,
     });
+    this.process = spawnedProcess;
 
-    this.process.on('error', (err) => {
+    spawnedProcess.on('error', (err) => {
       traceErr('Process error', err);
       try { fs.closeSync(logFd); } catch {}
     });
 
-    this.process.on('exit', (code) => {
+    spawnedProcess.on('exit', (code) => {
       trace(`Process exited with code ${code}`);
       try { fs.closeSync(logFd); } catch {}
-      this.cleanup();
+      if (this.process === spawnedProcess) {
+        this.cleanup(false);
+        this.process = null;
+      }
     });
 
     const initialDelayMs = parseInt(process.env.WINUAE_GDB_INITIAL_DELAY_MS || '5000', 10);
@@ -193,7 +206,7 @@ export class WinUAEConnection {
     } catch (err) {
       // Close log fd and clean up if GDB connection fails after launch
       try { fs.closeSync(logFd); } catch {}
-      this.cleanup();
+      this.cleanup(true);
       throw err;
     }
   }
@@ -208,6 +221,8 @@ export class WinUAEConnection {
 
     trace(`connectExisting: port ${this.config.gdbPort}`);
     await this.waitForGdb();
+    this.connectionMode = 'attached';
+    this.markActivity('connect_existing');
   }
 
   /**
@@ -220,6 +235,8 @@ export class WinUAEConnection {
         this.protocol = new GdbProtocol();
         await this.protocol.connect('127.0.0.1', this.config.gdbPort);
         this.isConnected = true;
+        this.connectionMode = 'attached';
+        this.markActivity('connect_existing');
         trace('tryQuickConnect: connected');
         return true;
       } catch (e) {
@@ -271,6 +288,8 @@ export class WinUAEConnection {
         await this.protocol.connect('127.0.0.1', this.config.gdbPort);
 
         this.isConnected = true;
+        this.connectionMode = this.process ? 'launched' : 'attached';
+        this.markActivity('connect');
         trace('Connected to GDB server');
         return;
       } catch (err) {
@@ -294,33 +313,35 @@ export class WinUAEConnection {
    */
   async restart(): Promise<string> {
     trace('Restarting with updated configuration...');
-    this.cleanup();
+    this.cleanup(true);
     await this.connect();
     return `Restarted WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
   }
 
   /**
-   * Disconnect and kill WinUAE
+   * Disconnect from GDB and optionally stop WinUAE.
    */
-  async disconnect(): Promise<void> {
-    if (!this.isConnected) {
+  async disconnect(stopEmulator: boolean = true): Promise<void> {
+    if (!this.isConnected && !this.hasTrackedProcess()) {
       return;
     }
 
-    this.cleanup();
+    this.cleanup(stopEmulator);
     if (this.logFilePath) trace(`Log file: ${this.logFilePath}`);
     trace('Disconnected');
   }
 
-  private cleanup(): void {
+  private cleanup(stopEmulator: boolean): void {
     this.isConnected = false;
+    this.connectionMode = 'disconnected';
+    this.clearIdleTimer();
 
     if (this.protocol) {
       this.protocol.disconnect();
       this.protocol = null;
     }
 
-    if (this.process) {
+    if (stopEmulator && this.process) {
       this.process.kill();
       this.process = null;
     }
@@ -373,5 +394,81 @@ export class WinUAEConnection {
 
   getFloppies(): Map<number, string> {
     return new Map(this.floppies);
+  }
+
+  setSessionIdlePolicy(timeoutMs: number, action?: SessionIdleAction): void {
+    this.sessionIdleTimeoutMs = Math.max(0, Math.trunc(timeoutMs));
+    if (action) {
+      this.sessionIdleAction = action;
+    }
+    if (this.isConnected) {
+      this.markActivity('session_policy_update');
+    } else {
+      this.clearIdleTimer();
+    }
+  }
+
+  markActivity(reason: string): void {
+    this.lastActivityAt = new Date();
+    this.lastActivityReason = reason;
+    this.scheduleIdleTimer();
+  }
+
+  hasTrackedProcess(): boolean {
+    return !!this.process && this.process.exitCode === null && !this.process.killed;
+  }
+
+  canAutoRestartManagedProcess(): boolean {
+    return this.connectionMode === 'launched' && this.hasTrackedProcess();
+  }
+
+  getSessionInfo(): {
+    connected: boolean;
+    connectionMode: 'launched' | 'attached' | 'disconnected';
+    trackedProcessRunning: boolean;
+    trackedProcessId: number | null;
+    idleTimeoutMs: number;
+    idleAction: SessionIdleAction;
+    lastActivityAt: string | null;
+    lastActivityReason: string;
+    logFilePath: string | null;
+    configFile: string;
+    winuaePath: string;
+    gdbPort: number;
+  } {
+    return {
+      connected: this.isConnected,
+      connectionMode: this.connectionMode,
+      trackedProcessRunning: this.hasTrackedProcess(),
+      trackedProcessId: this.process?.pid ?? null,
+      idleTimeoutMs: this.sessionIdleTimeoutMs,
+      idleAction: this.sessionIdleAction,
+      lastActivityAt: this.lastActivityAt ? this.lastActivityAt.toISOString() : null,
+      lastActivityReason: this.lastActivityReason,
+      logFilePath: this.logFilePath,
+      configFile: this.config.configFile,
+      winuaePath: this.config.winuaePath,
+      gdbPort: this.config.gdbPort,
+    };
+  }
+
+  private clearIdleTimer(): void {
+    if (this.sessionIdleTimer) {
+      clearTimeout(this.sessionIdleTimer);
+      this.sessionIdleTimer = null;
+    }
+  }
+
+  private scheduleIdleTimer(): void {
+    this.clearIdleTimer();
+    if (!this.isConnected || this.sessionIdleTimeoutMs <= 0) {
+      return;
+    }
+
+    this.sessionIdleTimer = setTimeout(() => {
+      const action = this.sessionIdleAction;
+      trace(`Idle timeout reached (${this.sessionIdleTimeoutMs}ms), action=${action}`);
+      void this.disconnect(action === 'shutdown');
+    }, this.sessionIdleTimeoutMs);
   }
 }
