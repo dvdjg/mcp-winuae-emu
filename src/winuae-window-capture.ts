@@ -7,6 +7,7 @@ export interface WinUAEWindowCaptureResult {
   width: number;
   height: number;
   title: string;
+  captureRegion: 'window' | 'client';
 }
 
 function buildPowerShellScript(outputPath: string, processId?: number): string {
@@ -30,8 +31,20 @@ public static class WinUaeCaptureNative {
     public int Bottom;
   }
 
+  [StructLayout(LayoutKind.Sequential)]
+  public struct POINT {
+    public int X;
+    public int Y;
+  }
+
   [DllImport("user32.dll")]
   public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+  [DllImport("user32.dll")]
+  public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+  [DllImport("user32.dll")]
+  public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
   [DllImport("user32.dll")]
   public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -65,26 +78,78 @@ if ($hWnd -eq [IntPtr]::Zero) {
 Start-Sleep -Milliseconds 120
 
 $rect = New-Object WinUaeCaptureNative+RECT
-if (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$rect)) {
-  throw 'GetWindowRect failed for the WinUAE window.'
+$captureRegion = 'window'
+if (-not [WinUaeCaptureNative]::GetClientRect($hWnd, [ref]$rect)) {
+  if (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$rect)) {
+    throw 'GetWindowRect failed for the WinUAE window.'
+  }
+} else {
+  $origin = New-Object WinUaeCaptureNative+POINT
+  $origin.X = 0
+  $origin.Y = 0
+  if ([WinUaeCaptureNative]::ClientToScreen($hWnd, [ref]$origin)) {
+    $clientWidth = [Math]::Max(1, $rect.Right - $rect.Left)
+    $clientHeight = [Math]::Max(1, $rect.Bottom - $rect.Top)
+    $rect.Left = $origin.X
+    $rect.Top = $origin.Y
+    $rect.Right = $origin.X + $clientWidth
+    $rect.Bottom = $origin.Y + $clientHeight
+    $captureRegion = 'client'
+  } elseif (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$rect)) {
+    throw 'GetWindowRect failed for the WinUAE window.'
+  }
 }
 
 $width = [Math]::Max(1, $rect.Right - $rect.Left)
 $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
 $bitmap = New-Object System.Drawing.Bitmap($width, $height)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$hdc = $graphics.GetHdc()
-try {
-  $printed = [WinUaeCaptureNative]::PrintWindow($hWnd, $hdc, 0)
-} finally {
-  $graphics.ReleaseHdc($hdc)
+
+function Test-MostlyBlackBitmap {
+  param(
+    [System.Drawing.Bitmap]$Bitmap
+  )
+
+  $sampleX = [Math]::Max(1, [int]($Bitmap.Width / 24))
+  $sampleY = [Math]::Max(1, [int]($Bitmap.Height / 24))
+  $samples = 0
+  $dark = 0
+
+  for ($y = 0; $y -lt $Bitmap.Height; $y += $sampleY) {
+    for ($x = 0; $x -lt $Bitmap.Width; $x += $sampleX) {
+      $pixel = $Bitmap.GetPixel($x, $y)
+      $luma = ($pixel.R * 30 + $pixel.G * 59 + $pixel.B * 11) / 100
+      if ($luma -lt 8) {
+        $dark++
+      }
+      $samples++
+    }
+  }
+
+  if ($samples -eq 0) {
+    return $false
+  }
+
+  return (($dark / $samples) -ge 0.95)
 }
 
-if ($printed) {
-  $method = 'printwindow'
-} else {
+$printed = $false
+try {
   $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
   $method = 'screen_copy'
+} catch {
+  $hdc = $graphics.GetHdc()
+  try {
+    $printed = [WinUaeCaptureNative]::PrintWindow($hWnd, $hdc, 0)
+  } finally {
+    $graphics.ReleaseHdc($hdc)
+  }
+
+  if ($printed -and -not (Test-MostlyBlackBitmap -Bitmap $bitmap)) {
+    $method = 'printwindow'
+  } else {
+    throw
+  }
 }
 
 $outPath = '${quotedPath}'
@@ -99,6 +164,7 @@ $bitmap.Dispose()
   width = $width
   height = $height
   title = $proc.MainWindowTitle
+  captureRegion = $captureRegion
 } | ConvertTo-Json -Compress
 `.trim();
 }

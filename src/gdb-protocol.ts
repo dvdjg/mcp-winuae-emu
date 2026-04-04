@@ -17,6 +17,11 @@ export interface M68kRegisters {
 
 export type WatchpointType = 'write' | 'read' | 'access';
 
+export interface GdbConnectOptions {
+  forceBreak?: boolean;
+  initializeStopped?: boolean;
+}
+
 const REGISTER_NAMES: (keyof M68kRegisters)[] = [
   'D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7',
   'A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7',
@@ -46,8 +51,10 @@ export class GdbProtocol {
   /**
    * Connect to GDB server and perform handshake
    */
-  async connect(host: string, port: number): Promise<void> {
+  async connect(host: string, port: number, options: GdbConnectOptions = {}): Promise<void> {
     const connectTimeoutMs = parseInt(process.env.WINUAE_GDB_CONNECT_TIMEOUT_MS || '3000', 10);
+    const forceBreak = options.forceBreak ?? (process.env.WINUAE_FORCE_BREAK !== '0');
+    const initializeStopped = options.initializeStopped ?? forceBreak;
     trace(`GDB connect ${host}:${port} timeout=${connectTimeoutMs}ms`);
 
     this.socket = new Socket();
@@ -84,12 +91,13 @@ export class GdbProtocol {
     // WinUAE only processes packets after Amiga hits a breakpoint and enters debugger.
     // For ADF games without debugging_trigger, we need to send Ctrl+C first to force debug mode.
     // Send Ctrl+C (0x03) to interrupt execution and enter debug mode.
-    const forceBreak = process.env.WINUAE_FORCE_BREAK !== '0';
     if (forceBreak) {
       trace('[GDB] Sending Ctrl+C to force debug mode...');
       this.socket.write(Buffer.from([0x03]));
       // Wait a bit for WinUAE to process the break
       await new Promise(resolve => setTimeout(resolve, 500));
+    } else {
+      trace('[GDB] Skipping initial Ctrl+C; connecting in non-intrusive mode.');
     }
 
     // Allow up to 60s for the first command (boot + hit breakpoint).
@@ -111,17 +119,22 @@ export class GdbProtocol {
       this.debug('[GDB] WINUAE_USE_ACK=1: keeping ack mode (may help memory write)');
     }
 
-    // Query halt reason
-    const haltReason = await this.sendCommand('?');
-    this.debug(`[GDB] Halt reason: ${haltReason}`);
-    
-    // Send qOffsets to trigger baseText calculation in WinUAE-DBG
-    // This is essential for breakpoint relocation when debugging user programs
-    try {
-      const offsets = await this.sendCommand('qOffsets');
-      this.debug(`[GDB] qOffsets response: ${offsets}`);
-    } catch (e) {
-      this.debug(`[GDB] qOffsets not supported or failed: ${e}`);
+    if (initializeStopped) {
+      // Query halt reason only when the target is expected to be stopped.
+      const haltReason = await this.sendCommand('?');
+      this.debug(`[GDB] Halt reason: ${haltReason}`);
+
+      // Send qOffsets to trigger baseText calculation in WinUAE-DBG.
+      // This is essential for breakpoint relocation when debugging user programs
+      // but should be skipped for non-intrusive attaches during boot/disk activity.
+      try {
+        const offsets = await this.sendCommand('qOffsets');
+        this.debug(`[GDB] qOffsets response: ${offsets}`);
+      } catch (e) {
+        this.debug(`[GDB] qOffsets not supported or failed: ${e}`);
+      }
+    } else {
+      this.debug('[GDB] Non-intrusive attach: skipping initial halt-reason and qOffsets queries.');
     }
   }
 
@@ -459,6 +472,14 @@ export class GdbProtocol {
       throw new Error(`Monitor command failed: ${reply}`);
     }
     return reply;
+  }
+
+  /**
+   * Query relocation offsets for the currently debugged program.
+   * Typical reply: Text=00000400;Data=00012345;Bss=00023456
+   */
+  async queryOffsets(): Promise<string> {
+    return this.sendCommand('qOffsets', 10000);
   }
 
   // ─── Breakpoint Commands ────────────────────────────────────────────

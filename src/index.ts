@@ -99,6 +99,20 @@ function cloneConnectionState(source: WinUAEConnection, target: WinUAEConnection
   }
 }
 
+function getConnectBehavior(args: Record<string, unknown>): { forceBreak?: boolean; initializeStopped?: boolean } {
+  const behavior: { forceBreak?: boolean; initializeStopped?: boolean } = {};
+  if (args.force_break !== undefined) {
+    behavior.forceBreak = args.force_break !== false;
+  }
+  if (args.initialize_stopped !== undefined) {
+    behavior.initializeStopped = args.initialize_stopped !== false;
+  }
+  if (behavior.initializeStopped === undefined && behavior.forceBreak === false) {
+    behavior.initializeStopped = false;
+  }
+  return behavior;
+}
+
 async function tryAutoAttachForTool(name: string, args: Record<string, unknown>): Promise<void> {
   if (CONNECTION_OPTIONAL_TOOLS.has(name) || connection?.connected) {
     return;
@@ -242,6 +256,43 @@ function hexDump(data: Buffer, startAddr: number, bytesPerLine: number = 16): st
     result += '|\n';
   }
   return result;
+}
+
+function parseMonitorMemoryMap(text: string): Array<{
+  name: string;
+  start: number;
+  size: number;
+  reserved: number;
+  flags: number;
+  base: string;
+}> {
+  const banks: Array<{
+    name: string;
+    start: number;
+    size: number;
+    reserved: number;
+    flags: number;
+    base: string;
+  }> = [];
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(
+      /^([a-zA-Z0-9]+):\s+start=([0-9a-fA-F]+)\s+size=([0-9a-fA-F]+)\s+reserved=([0-9a-fA-F]+)\s+flags=([0-9a-fA-F]+)\s+base=([0-9A-Fa-f]+|[0-9A-Fa-fx]+)/
+    );
+    if (!match) continue;
+    banks.push({
+      name: match[1],
+      start: parseInt(match[2], 16) >>> 0,
+      size: parseInt(match[3], 16) >>> 0,
+      reserved: parseInt(match[4], 16) >>> 0,
+      flags: parseInt(match[5], 16) >>> 0,
+      base: match[6],
+    });
+  }
+
+  return banks;
 }
 
 function formatRegisters(regs: M68kRegisters): string {
@@ -390,6 +441,16 @@ const tools: Tool[] = [
           enum: ['detach', 'shutdown'],
           description: 'Optional idle action. detach leaves WinUAE running, shutdown closes the launched emulator process.',
         },
+        force_break: {
+          type: 'boolean',
+          description: 'If false, connect without sending an initial Ctrl+C. Useful for non-intrusive ADF/disk boot observation.',
+          default: true,
+        },
+        initialize_stopped: {
+          type: 'boolean',
+          description: 'If false, skip initial halt-state queries that assume the target is already stopped. Usually pair with force_break=false.',
+          default: true,
+        },
       },
     },
   },
@@ -411,6 +472,16 @@ const tools: Tool[] = [
           type: 'string',
           enum: ['detach', 'shutdown'],
           description: 'Optional idle action. detach leaves WinUAE running, shutdown closes the launched emulator process if this MCP started it.',
+        },
+        force_break: {
+          type: 'boolean',
+          description: 'If false, attach without sending an initial Ctrl+C. Useful to observe an already-running boot sequence non-intrusively.',
+          default: true,
+        },
+        initialize_stopped: {
+          type: 'boolean',
+          description: 'If false, skip initial halt-state queries that assume the target is already stopped. Usually pair with force_break=false.',
+          default: true,
         },
       },
     },
@@ -455,6 +526,22 @@ const tools: Tool[] = [
           default: 'detach',
         },
       },
+    },
+  },
+  {
+    name: 'winuae_memory_map',
+    description: 'Return the current Amiga memory-bank map as JSON parsed from the WinUAE monitor. Useful before fixed-address loads to confirm Chip/Bogo/Fast RAM ranges are mapped.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'winuae_qoffsets',
+    description: 'Return qOffsets relocation info for the current AmigaDOS program. Useful to resolve ELF symbols after an OS-loaded executable starts.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
     },
   },
 
@@ -1444,16 +1531,22 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           }, null, 2) }] };
         }
         const cfg: WinUAEConfig = getBaseConfigForArgs(normalizedArgs);
+        const previousConnection = connection;
         connection = new WinUAEConnection(cfg);
+        if (previousConnection) {
+          cloneConnectionState(previousConnection, connection);
+        }
+        const connectBehavior = getConnectBehavior(normalizedArgs);
         if (args?.idle_timeout_ms !== undefined || args?.idle_action !== undefined) {
           connection.setSessionIdlePolicy(
             Number(args?.idle_timeout_ms ?? 0),
             args?.idle_action as SessionIdleAction | undefined
           );
         }
-        const statusMsg = await connection.connectSmart();
+        const statusMsg = await connection.connectSmart(connectBehavior);
         return { content: [{ type: 'text', text: JSON.stringify({
           message: statusMsg,
+          connect_behavior: connectBehavior,
           session: connection.getSessionInfo(),
         }, null, 2) }] };
       }
@@ -1467,16 +1560,22 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           }, null, 2) }] };
         }
         const cfgEx: WinUAEConfig = getBaseConfigForArgs(normalizedArgs);
+        const previousConnection = connection;
         connection = new WinUAEConnection(cfgEx);
+        if (previousConnection) {
+          cloneConnectionState(previousConnection, connection);
+        }
+        const connectBehavior = getConnectBehavior(normalizedArgs);
         if (args?.idle_timeout_ms !== undefined || args?.idle_action !== undefined) {
           connection.setSessionIdlePolicy(
             Number(args?.idle_timeout_ms ?? 0),
             args?.idle_action as SessionIdleAction | undefined
           );
         }
-        await connection.connectExisting();
+        await connection.connectExisting(connectBehavior);
         return { content: [{ type: 'text', text: JSON.stringify({
           message: `Connected to existing WinUAE GDB server on port ${config.gdbPort}. Do not call winuae_load (program already running).`,
+          connect_behavior: connectBehavior,
           session: connection.getSessionInfo(),
         }, null, 2) }] };
       }
@@ -1521,6 +1620,46 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           message: 'WinUAE session policy updated',
           session: connection.getSessionInfo(),
         }, null, 2) }] };
+      }
+
+      case 'winuae_memory_map': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const reply = await protocol.sendMonitorCommand('memcfg', 10000);
+        const textReply = /^[0-9a-fA-F]+$/.test(reply) && reply.length % 2 === 0
+          ? Buffer.from(reply, 'hex').toString('utf8')
+          : reply;
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              banks: parseMonitorMemoryMap(textReply),
+              raw: textReply,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case 'winuae_qoffsets': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const reply = await protocol.queryOffsets();
+        const normalized = reply.startsWith('Text=') ? reply : reply.trim();
+        const match = normalized.match(/Text=([0-9A-Fa-f]+);Data=([0-9A-Fa-f]+);Bss=([0-9A-Fa-f]+)/);
+        if (!match) {
+          return { content: [{ type: 'text', text: JSON.stringify({ raw: normalized }, null, 2) }] };
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              text: parseInt(match[1], 16) >>> 0,
+              data: parseInt(match[2], 16) >>> 0,
+              bss: parseInt(match[3], 16) >>> 0,
+              raw: normalized,
+            }, null, 2),
+          }],
+        };
       }
 
       case 'winuae_load': {

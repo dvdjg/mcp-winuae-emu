@@ -87,11 +87,13 @@ The server reads your config, merges in GDB-required settings, and launches `win
 
 | Tool | Description |
 |---|---|
-| `winuae_connect` | Launch WinUAE and connect to GDB server. Optional `config_file` overrides `WINUAE_CONFIG` for this session. |
-| `winuae_connect_existing` | Attach to GDB on port 2345 (WinUAE already running). |
+| `winuae_connect` | Launch WinUAE and connect to GDB server. Optional `config_file` overrides `WINUAE_CONFIG` for this session. Supports non-intrusive attach with `force_break=false` and `initialize_stopped=false`. |
+| `winuae_connect_existing` | Attach to GDB on port 2345 (WinUAE already running). Supports non-intrusive attach with `force_break=false` and `initialize_stopped=false`. |
 | `winuae_disconnect` | Disconnect from GDB and optionally leave the emulator process running (`stop_emulator=false`) |
 | `winuae_status` | Return JSON session status, health, tracked floppies, reusable-session policy, and tracked PID when this MCP launched WinUAE |
 | `winuae_session_config` | Configure reusable-session idle timeout and whether idle expiry detaches or shuts WinUAE down |
+| `winuae_memory_map` | Return the current memory-bank map parsed from `monitor memcfg` (Chip/Bogo/Fast/Z3 Fast) |
+| `winuae_qoffsets` | Return `qOffsets` relocation info for the current AmigaDOS program when the stub provides it |
 
 ### Memory
 
@@ -171,6 +173,7 @@ When using WinUAE-DBG or Bartman fork with monitor support, the MCP server can s
 | `input event <event_id> [state]` | Send raw input event (state 1/0/2) |
 | `reset` | Restore savestate at process entry (when debugging_trigger set) |
 | `profile <n> <unwind> <out>` | Frame profiler: N frames, optional unwind table, output file. Produces same data as vscode-amiga-debug (DMA per scanline, blitter, CRT flow, screenshots). |
+| `memcfg` | Dump the current memory-bank map so tools can confirm where Chip/Bogo/Fast RAM are actually mapped before direct loads |
 
 ### Frame profiling
 
@@ -184,6 +187,7 @@ There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “
 - **Crash/postmortem bundle**: Call `winuae_postmortem_capture` after a suspicious stop, requester, or crash to preserve stop reason, CPU, stack, disassembly around PC, and optional custom/chip snapshot data in JSON/Markdown.
 - **Pattern search**: Call `winuae_memory_pattern_search` with a RAM range plus `pattern_hex`. Add `stride_bytes` and `repeat_count` when searching repeated row signatures or record layouts; results come back as scored candidates with addresses.
 - **Relocatable AmigaHunk load**: `winuae_load` detects classic AmigaHunk executables, assigns contiguous load addresses, applies `RELOC32`, and writes relocated hunks before verification.
+- **Memory-map introspection**: Call `winuae_memory_map` before a fixed-address or "metal" load. In the current A500 battery profile, Fast RAM is visible at runtime and should be preferred for bare-metal experiments, but the low end of a bank may still be a bad place to collide with live system allocations.
 - **Conditional breakpoints**: `winuae_breakpoint_conditional_wait` uses a normal software breakpoint plus server-side predicate checks on registers, custom registers, or exact memory bytes. The current WinUAE GDB stub does not expose native GDB-expression conditional breakpoints, so this helper is explicitly software-assisted.
 - **Software input intermediary**: `winuae_amiga_input_set` writes the `g_automation_input` buffer used by Cursor-Amiga-C, which is more reliable for screen-coordinate mouse movement and scripted UI navigation than blind host-side deltas alone.
 
@@ -200,9 +204,11 @@ There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “
 - `winuae_bitmap_decode` supports 1–8 bitplanes, row-interleaved or plane-sequential layouts, and can derive palette from custom COLOR registers. Inline RGBA output is limited to **16384 pixels**; use PNG for larger images.
 - `winuae_memory_pattern_search` caps the scanned RAM range at **256 KiB**, the pattern at **8 KiB**, and the result list at **64** candidates to keep MCP responses bounded.
 - `winuae_load` now supports a practical subset of AmigaHunk (`HEADER`, `CODE`, `DATA`, `BSS`, `RELOC32`, `END`) for typical toolchain outputs. Unsupported hunk block types still fail fast.
+- Direct fixed-address Hunk loading is still marked operationally fragile in this workspace: WinUAE-DBG now exposes `memcfg`, and MCP stores memory-map evidence, but the current live T01 route still crashes the emulator process during post-write verification of some Hunk uploads. That is a known debugger/runtime blocker, not yet a closed test path.
 - `winuae_breakpoint_conditional_wait` is a server-side loop over ordinary breakpoint hits; it is useful for automation, but it is not the same as native stub-side conditional expressions.
 - `winuae_amiga_input_set` depends on the target Amiga program exporting `g_automation_input` (or on you passing `automation_address`). For Cursor-Amiga-C this is now the preferred path for deterministic mouse/keyboard/joystick automation inside the app.
 - Reusable sessions are supported: `winuae_connect` already tries an existing GDB server first, and `winuae_session_config` can keep the emulator open across turns with either `detach` or `shutdown` idle behavior. On the current WinUAE build, the most reliable cross-turn reuse is still an externally launched visible session plus `winuae_connect_existing`.
+- For visible-session evidence, `winuae_screenshot` with `capture_mode=host_window` is now the most faithful way to see what the user sees on screen. The helper prioritizes desktop `screen_copy` because `PrintWindow` can report success while returning a black frame for WinUAE.
 - `npm run test:adf-matrix` runs the reproducible A-MCP-01 verification matrix (`scripts/a-mcp-01-matrix.mjs`) and writes `report.json` plus `report.md` under `test-output/a-mcp-01-matrix/`.
 - `npm run test:snapshot-live` runs the live A-MCP-02 validation (`scripts/a-mcp-02-live.mjs`) and writes `a-mcp-02-live-machine-snapshot.json` plus `a-mcp-02-live-validation-summary.json` under `Cursor-Amiga-C/out/`.
 - If `dfN insert/eject` fails while attached through `winuae_connect_existing`, MCP now keeps the requested floppy state for the next managed launch instead of silently spawning a replacement WinUAE instance that it does not control.

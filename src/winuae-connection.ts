@@ -13,7 +13,7 @@
  */
 
 import { spawn, ChildProcess } from 'child_process';
-import { GdbProtocol } from './gdb-protocol.js';
+import { GdbConnectOptions, GdbProtocol } from './gdb-protocol.js';
 import { trace, traceErr } from './trace.js';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -24,6 +24,8 @@ export interface WinUAEConfig {
   configFile: string;
   gdbPort: number;
 }
+
+export interface WinUAEConnectBehavior extends GdbConnectOptions {}
 
 export type SessionIdleAction = 'detach' | 'shutdown';
 
@@ -85,7 +87,7 @@ export class WinUAEConnection {
    * 4. Launch with -portable flag
    * 5. Retry-connect to TCP port 2345
    */
-  async connect(): Promise<void> {
+  async connect(connectBehavior: WinUAEConnectBehavior = {}): Promise<void> {
     if (this.isConnected) {
       throw new Error('Already connected to WinUAE');
     }
@@ -202,7 +204,7 @@ export class WinUAEConnection {
 
     // Wait for GDB server to become available
     try {
-      await this.waitForGdb();
+      await this.waitForGdb(connectBehavior);
     } catch (err) {
       // Close log fd and clean up if GDB connection fails after launch
       try { fs.closeSync(logFd); } catch {}
@@ -214,13 +216,13 @@ export class WinUAEConnection {
   /**
    * Connect to an already-running WinUAE instance (no process spawn)
    */
-  async connectExisting(): Promise<void> {
+  async connectExisting(connectBehavior: WinUAEConnectBehavior = {}): Promise<void> {
     if (this.isConnected) {
       throw new Error('Already connected to WinUAE');
     }
 
     trace(`connectExisting: port ${this.config.gdbPort}`);
-    await this.waitForGdb();
+    await this.waitForGdb(connectBehavior);
     this.connectionMode = 'attached';
     this.markActivity('connect_existing');
   }
@@ -229,11 +231,11 @@ export class WinUAEConnection {
    * Try to quickly connect to an existing GDB server (fast, 2 attempts).
    * Returns true if connected, false if no server found.
    */
-  private async tryQuickConnect(): Promise<boolean> {
+  private async tryQuickConnect(connectBehavior: WinUAEConnectBehavior = {}): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         this.protocol = new GdbProtocol();
-        await this.protocol.connect('127.0.0.1', this.config.gdbPort);
+        await this.protocol.connect('127.0.0.1', this.config.gdbPort, connectBehavior);
         this.isConnected = true;
         this.connectionMode = 'attached';
         this.markActivity('connect_existing');
@@ -257,18 +259,18 @@ export class WinUAEConnection {
    * Smart connect: try existing GDB server first, then launch WinUAE if needed.
    * Returns a status message describing what happened.
    */
-  async connectSmart(): Promise<string> {
+  async connectSmart(connectBehavior: WinUAEConnectBehavior = {}): Promise<string> {
     if (this.isConnected) {
       throw new Error('Already connected to WinUAE');
     }
 
     // Try quick connect to an already-running instance
-    if (await this.tryQuickConnect()) {
+    if (await this.tryQuickConnect(connectBehavior)) {
       return `Connected to existing WinUAE GDB server on port ${this.config.gdbPort}`;
     }
 
     trace('No existing GDB server, launching WinUAE...');
-    await this.connect();
+    await this.connect(connectBehavior);
     return `Launched WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
   }
 
@@ -276,7 +278,7 @@ export class WinUAEConnection {
    * Wait for GDB server. Default: 10 attempts × 500ms = 5s (fail fast).
    * WINUAE_GDB_MAX_ATTEMPTS, WINUAE_GDB_DELAY_MS to override.
    */
-  private async waitForGdb(): Promise<void> {
+  private async waitForGdb(connectBehavior: WinUAEConnectBehavior = {}): Promise<void> {
     const maxAttempts = parseInt(process.env.WINUAE_GDB_MAX_ATTEMPTS || '10', 10);
     const delayMs = parseInt(process.env.WINUAE_GDB_DELAY_MS || '500', 10);
     trace(`waitForGdb: maxAttempts=${maxAttempts} delayMs=${delayMs} (${(maxAttempts * delayMs) / 1000}s max)`);
@@ -285,7 +287,7 @@ export class WinUAEConnection {
       try {
         trace(`Attempt ${attempt + 1}/${maxAttempts} connecting to 127.0.0.1:${this.config.gdbPort}`);
         this.protocol = new GdbProtocol();
-        await this.protocol.connect('127.0.0.1', this.config.gdbPort);
+        await this.protocol.connect('127.0.0.1', this.config.gdbPort, connectBehavior);
 
         this.isConnected = true;
         this.connectionMode = this.process ? 'launched' : 'attached';
