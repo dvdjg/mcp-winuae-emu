@@ -1948,17 +1948,34 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           return { content: [{ type: 'text', text: 'No registers specified to write' }] };
         }
 
-        // Write one register at a time, verify each before proceeding.
-        // The WinUAE GDB server needs time between register writes.
         const results: string[] = [];
-        for (const { name, idx, value } of toWrite) {
-          await protocol.writeRegister(idx, value);
-          // Read back to verify and to drain the GDB server state
-          const actual = await protocol.readRegister(idx);
-          if (actual !== (value >>> 0)) {
-            results.push(`${name}=${hex32(value)} (VERIFY FAILED: got ${hex32(actual)})`);
-          } else {
-            results.push(`${name}=${hex32(value)}`);
+        const needsCoherentWrite = toWrite.some(({ name }) => name === 'PC' || name === 'SR' || name === 'A7');
+
+        if (needsCoherentWrite) {
+          const regs = await protocol.readRegisters();
+          for (const { name, value } of toWrite) {
+            (regs as unknown as Record<string, number>)[name] = value >>> 0;
+          }
+          await protocol.writeRegisters(regs);
+          const actualRegs = await protocol.readRegisters();
+          for (const { name, value } of toWrite) {
+            const actual = ((actualRegs as unknown as Record<string, number>)[name] ?? 0) >>> 0;
+            if (actual !== (value >>> 0)) {
+              results.push(`${name}=${hex32(value)} (VERIFY FAILED: got ${hex32(actual)})`);
+            } else {
+              results.push(`${name}=${hex32(value)}`);
+            }
+          }
+        } else {
+          // Keep single-register writes for low-risk edits that do not change execution context.
+          for (const { name, idx, value } of toWrite) {
+            await protocol.writeRegister(idx, value);
+            const actual = await protocol.readRegister(idx);
+            if (actual !== (value >>> 0)) {
+              results.push(`${name}=${hex32(value)} (VERIFY FAILED: got ${hex32(actual)})`);
+            } else {
+              results.push(`${name}=${hex32(value)}`);
+            }
           }
         }
 
