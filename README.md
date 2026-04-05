@@ -145,7 +145,7 @@ The server reads your config, merges in GDB-required settings, and launches `win
 
 | Tool | Description |
 |---|---|
-| `winuae_screenshot` | Capture display to PNG. `capture_mode=auto` tries WinUAE monitor first and falls back to capturing the visible WinUAE host window. |
+| `winuae_screenshot` | Capture display to PNG. `capture_mode=monitor` or `capture_mode=internal` captures from WinUAE internal framebuffer path (qRcmd screenshot). `capture_mode=auto` only falls back to visible host window if internal capture fails. |
 | `winuae_run_program` | Load binary into memory, set PC, and start execution. For testing executables. |
 | `winuae_exec_chunk` | Write hex-encoded machine code at `address`, set PC (and optional SP/A7), optionally `continue_after`. |
 | `winuae_profile` | Run frame profiler for N frames; writes binary with CPU samples, DMA per scanline (CRT/blitter), custom regs, screenshots. Same format as [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame/Graphics profiler. |
@@ -213,7 +213,7 @@ There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “
 - `npm run test:snapshot-live` runs the live A-MCP-02 validation (`scripts/a-mcp-02-live.mjs`) and writes `a-mcp-02-live-machine-snapshot.json` plus `a-mcp-02-live-validation-summary.json` under `Cursor-Amiga-C/out/`.
 - If `dfN insert/eject` fails while attached through `winuae_connect_existing`, MCP now keeps the requested floppy state for the next managed launch instead of silently spawning a replacement WinUAE instance that it does not control.
 - Most tools now try a lightweight auto-attach to an already-running WinUAE GDB server before failing with "Not connected", so a visible session from a previous turn can often be reused without an explicit `winuae_connect_existing`.
-- `winuae_screenshot` supports `capture_mode=auto|monitor|host_window`. The host-window path is Windows-only and requires a visible WinUAE window, but it gives a practical fallback when the monitor `screenshot` command returns an error such as `E03`.
+- `winuae_screenshot` supports `capture_mode=auto|monitor|internal|host_window`. `monitor/internal` are internal buffer capture modes (preferred for evidence), while `host_window` is Windows-only fallback that captures what is visible on desktop.
 - The `-G` flag and `-s` overrides **must** be CLI arguments. This WinUAE build (v4.10.1) ignores `use_gui` and `debugging_features` when set in the config file.
 - The GDB server sends `O` packets (console output) on connect. The protocol handler skips these automatically.
 - Custom chip register reads use 64-byte chunks because the GDB server has read-size limits for hardware I/O addresses.

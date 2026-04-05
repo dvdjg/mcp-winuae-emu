@@ -1469,8 +1469,8 @@ const tools: Tool[] = [
         },
         capture_mode: {
           type: 'string',
-          enum: ['auto', 'monitor', 'host_window'],
-          description: 'auto=try WinUAE monitor first then host window fallback, monitor=only qRcmd screenshot, host_window=only capture the visible WinUAE window.',
+          enum: ['auto', 'monitor', 'internal', 'host_window'],
+          description: 'auto=try WinUAE internal monitor screenshot first then host window fallback, monitor/internal=only qRcmd internal screenshot, host_window=only capture the visible WinUAE window.',
           default: 'auto',
         },
       },
@@ -2356,24 +2356,28 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const sessionInfo = connection.getSessionInfo();
         let monitorError: string | null = null;
 
+        const internalOnly = captureMode === 'monitor' || captureMode === 'internal';
         if (captureMode !== 'host_window') {
           try {
             const winPath = filepath.replace(/\//g, '\\');
             const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, 15000);
             const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
+            const sizeMatch = textReply.match(/OK\s+(\d+)x(\d+)/i);
             return {
               content: [{
                 type: 'text',
                 text: JSON.stringify({
                   file: filepath,
-                  capture_mode: 'monitor',
+                  capture_mode: 'internal_buffer',
+                  width: sizeMatch ? Number.parseInt(sizeMatch[1], 10) : null,
+                  height: sizeMatch ? Number.parseInt(sizeMatch[2], 10) : null,
                   reply: textReply,
                 }, null, 2),
               }],
             };
           } catch (error) {
             monitorError = error instanceof Error ? error.message : String(error);
-            if (captureMode === 'monitor') {
+            if (internalOnly) {
               throw error;
             }
           }
