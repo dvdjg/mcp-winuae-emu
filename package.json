@@ -15,6 +15,7 @@
     "test:hunk": "node dist/amiga-hunk-selftest.js",
     "test:bitmap": "node dist/bitmap-decode-selftest.js",
     "test:snapshot-live": "npm run build && node scripts/a-mcp-02-live.mjs",
+    "test:screenshot-internal-live": "npm run build && node scripts/test-screenshot-internal-live.mjs",
     "test:pattern": "node dist/memory-pattern-search-selftest.js",
     "test:session": "node dist/winuae-session-selftest.js",
     "test:snapshot": "node dist/machine-snapshot-selftest.js",
