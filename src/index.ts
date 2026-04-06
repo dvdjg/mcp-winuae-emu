@@ -55,6 +55,7 @@ import {
   resolveEnterDemoAddress,
 } from './amiga-automation-input.js';
 import { captureWinUAEWindow } from './winuae-window-capture.js';
+import { trace, traceErr } from './trace.js';
 import * as path from 'path';
 
 // ─── Configuration from environment ──────────────────────────────────
@@ -326,14 +327,33 @@ function formatRegisters(regs: M68kRegisters): string {
   return lines.join('\n');
 }
 
-async function readCustomRegisterData(protocol: GdbProtocol): Promise<{ data: Buffer; unreadableChunkOffsets: number[] }> {
+function isTransientWinUaeTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message ?? '';
+  const code = (error as { code?: string }).code;
+  return code === 'ECONNRESET' ||
+    message.includes('ECONNRESET') ||
+    message.includes('Disconnected') ||
+    message.includes('Socket closed');
+}
+
+async function readCustomRegisterData(
+  protocol: GdbProtocol,
+  propagateTransientErrors: boolean = false
+): Promise<{ data: Buffer; unreadableChunkOffsets: number[] }> {
   const chunks: Buffer[] = [];
   const unreadableChunkOffsets: number[] = [];
 
   for (let off = 0; off < CUSTOM_REGISTER_SIZE; off += CUSTOM_REGISTER_CHUNK_SIZE) {
     try {
       chunks.push(await protocol.readMemory(0xDFF000 + off, CUSTOM_REGISTER_CHUNK_SIZE));
-    } catch {
+    } catch (error) {
+      if (propagateTransientErrors && isTransientWinUaeTransportError(error)) {
+        throw error;
+      }
       unreadableChunkOffsets.push(off);
       chunks.push(Buffer.alloc(CUSTOM_REGISTER_CHUNK_SIZE, 0));
     }
@@ -2249,7 +2269,6 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
 
       case 'winuae_bitmap_decode': {
         if (!connection?.connected) throw new Error('Not connected to WinUAE');
-        const protocol = connection.getProtocol();
         const addr = parseHexOrDecimal(args.address);
         const request = normalizeBitmapDecodeRequest({
           width: Number(args.width),
@@ -2261,46 +2280,73 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           palette: args.palette,
         });
         const outputFormat = args.output_format ?? 'png';
-        const bitmapData = await protocol.readMemory(addr, request.bytesToRead);
+        let lastError: unknown = null;
 
-        let customSnapshot;
-        if ((args.use_custom_palette ?? true) && (!args.palette || args.palette.length === 0)) {
-          const { data, unreadableChunkOffsets } = await readCustomRegisterData(protocol);
-          customSnapshot = buildCustomRegisterSnapshot(data, CUSTOM_REGS, unreadableChunkOffsets);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const protocol = connection.getProtocol();
+            const bitmapData = await protocol.readMemory(addr, request.bytesToRead);
+
+            let customSnapshot;
+            if ((args.use_custom_palette ?? true) && (!args.palette || args.palette.length === 0)) {
+              const { data, unreadableChunkOffsets } = await readCustomRegisterData(protocol, true);
+              customSnapshot = buildCustomRegisterSnapshot(data, CUSTOM_REGS, unreadableChunkOffsets);
+            }
+
+            const decoded = decodePlanarBitmap(bitmapData, {
+              width: request.width,
+              height: request.height,
+              depth: request.depth,
+              rowBytes: request.rowBytes,
+              layout: request.layout,
+              colorMode: request.colorMode,
+            }, customSnapshot, args.palette);
+
+            if (outputFormat === 'rgba') {
+              const rgbaHex = rgbaToHex(decoded.rgba);
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, undefined, rgbaHex), null, 2),
+                }],
+              };
+            } else {
+              const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+              const fileName = args.filepath ?? `winuae-bitmap-${timestamp}.png`;
+              const { resolve } = await import('path');
+              const os = await import('os');
+              const fs = await import('fs');
+              const outputPath = path.isAbsolute(fileName) ? resolve(fileName) : path.join(os.tmpdir(), fileName);
+              fs.writeFileSync(outputPath, encodePngRgba(decoded.width, decoded.height, decoded.rgba));
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, outputPath), null, 2),
+                }],
+              };
+            }
+          } catch (error) {
+            lastError = error;
+            if (attempt === 0 && isTransientWinUaeTransportError(error)) {
+              traceErr('winuae_bitmap_decode: transient transport error, retrying once', error);
+              try {
+                if (connection?.connected) {
+                  await connection.disconnect(false);
+                }
+              } catch (disconnectError) {
+                traceErr('winuae_bitmap_decode: disconnect before retry failed', disconnectError);
+              }
+
+              trace('winuae_bitmap_decode: reconnecting WinUAE GDB session for retry (non-intrusive)');
+              await connection.connectExisting({ forceBreak: false, initializeStopped: false });
+              trace('winuae_bitmap_decode: retry connection established');
+              continue;
+            }
+            throw error;
+          }
         }
 
-        const decoded = decodePlanarBitmap(bitmapData, {
-          width: request.width,
-          height: request.height,
-          depth: request.depth,
-          rowBytes: request.rowBytes,
-          layout: request.layout,
-          colorMode: request.colorMode,
-        }, customSnapshot, args.palette);
-
-        if (outputFormat === 'rgba') {
-          const rgbaHex = rgbaToHex(decoded.rgba);
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, undefined, rgbaHex), null, 2),
-            }],
-          };
-        } else {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-          const fileName = args.filepath ?? `winuae-bitmap-${timestamp}.png`;
-          const { resolve } = await import('path');
-          const os = await import('os');
-          const fs = await import('fs');
-          const outputPath = path.isAbsolute(fileName) ? resolve(fileName) : path.join(os.tmpdir(), fileName);
-          fs.writeFileSync(outputPath, encodePngRgba(decoded.width, decoded.height, decoded.rgba));
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify(buildBitmapDecodeResponse(decoded, addr, outputPath), null, 2),
-            }],
-          };
-        }
+        throw lastError instanceof Error ? lastError : new Error('winuae_bitmap_decode failed');
       }
 
       case 'winuae_memory_pattern_search': {
