@@ -360,11 +360,33 @@ export class GdbProtocol {
    * Read memory: sends 'm<addr>,<len>', returns Buffer
    */
   async readMemory(addr: number, length: number): Promise<Buffer> {
-    const reply = await this.sendCommand(`m${addr.toString(16)},${length.toString(16)}`);
-    if (reply.startsWith('E')) {
-      throw new Error(`Memory read error at $${addr.toString(16)}: ${reply}`);
+    if (length <= 0) {
+      return Buffer.alloc(0);
     }
-    return Buffer.from(reply, 'hex');
+    const chunkSize = Math.max(1, parseInt(process.env.WINUAE_GDB_READ_CHUNK_SIZE || '1024', 10) || 1024);
+    const baseTimeoutMs = Math.max(1000, parseInt(process.env.WINUAE_GDB_READ_TIMEOUT_MS || '20000', 10) || 20000);
+    const timeoutPerKbMs = Math.max(0, parseInt(process.env.WINUAE_GDB_READ_TIMEOUT_PER_KB_MS || '1500', 10) || 1500);
+
+    const readChunk = async (chunkAddr: number, chunkLength: number): Promise<Buffer> => {
+      const timeoutMs = baseTimeoutMs + Math.ceil(chunkLength / 1024) * timeoutPerKbMs;
+      trace(`readMemory chunk addr=$${chunkAddr.toString(16)} len=${chunkLength} timeout=${timeoutMs}ms`);
+      const reply = await this.sendCommand(`m${chunkAddr.toString(16)},${chunkLength.toString(16)}`, timeoutMs);
+      if (reply.startsWith('E')) {
+        throw new Error(`Memory read error at $${chunkAddr.toString(16)}: ${reply}`);
+      }
+      return Buffer.from(reply, 'hex');
+    };
+
+    if (length <= chunkSize) {
+      return readChunk(addr, length);
+    }
+
+    const chunks: Buffer[] = [];
+    for (let offset = 0; offset < length; offset += chunkSize) {
+      const chunkLength = Math.min(chunkSize, length - offset);
+      chunks.push(await readChunk(addr + offset, chunkLength));
+    }
+    return Buffer.concat(chunks, length);
   }
 
   /**

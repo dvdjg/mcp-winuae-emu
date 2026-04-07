@@ -8,6 +8,10 @@ export interface WinUAEWindowCaptureResult {
   height: number;
   title: string;
   captureRegion: 'window' | 'client';
+  sourceWidth: number;
+  sourceHeight: number;
+  cropLeft: number;
+  cropTop: number;
 }
 
 function buildPowerShellScript(outputPath: string, processId?: number): string {
@@ -22,6 +26,7 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class WinUaeCaptureNative {
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT {
@@ -43,8 +48,8 @@ public static class WinUaeCaptureNative {
   [DllImport("user32.dll")]
   public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
 
-  [DllImport("user32.dll")]
-  public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+[DllImport("user32.dll")]
+public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
   [DllImport("user32.dll")]
   public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -54,6 +59,19 @@ public static class WinUaeCaptureNative {
 
   [DllImport("user32.dll")]
   public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, int nFlags);
+
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr hWnd);
+
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+  public const int PW_CLIENTONLY = 0x00000001;
 }
 "@
 
@@ -77,32 +95,86 @@ if ($hWnd -eq [IntPtr]::Zero) {
 [WinUaeCaptureNative]::SetForegroundWindow($hWnd) | Out-Null
 Start-Sleep -Milliseconds 120
 
-$rect = New-Object WinUaeCaptureNative+RECT
+$windowRect = New-Object WinUaeCaptureNative+RECT
+if (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$windowRect)) {
+  throw 'GetWindowRect failed for the WinUAE window.'
+}
+
+$windowWidth = [Math]::Max(1, $windowRect.Right - $windowRect.Left)
+$windowHeight = [Math]::Max(1, $windowRect.Bottom - $windowRect.Top)
 $captureRegion = 'window'
-if (-not [WinUaeCaptureNative]::GetClientRect($hWnd, [ref]$rect)) {
-  if (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$rect)) {
-    throw 'GetWindowRect failed for the WinUAE window.'
-  }
-} else {
+$cropLeft = 0
+$cropTop = 0
+$cropWidth = $windowWidth
+$cropHeight = $windowHeight
+$clientScreenLeft = $windowRect.Left
+$clientScreenTop = $windowRect.Top
+
+$clientRect = New-Object WinUaeCaptureNative+RECT
+if ([WinUaeCaptureNative]::GetClientRect($hWnd, [ref]$clientRect)) {
   $origin = New-Object WinUaeCaptureNative+POINT
   $origin.X = 0
   $origin.Y = 0
   if ([WinUaeCaptureNative]::ClientToScreen($hWnd, [ref]$origin)) {
-    $clientWidth = [Math]::Max(1, $rect.Right - $rect.Left)
-    $clientHeight = [Math]::Max(1, $rect.Bottom - $rect.Top)
-    $rect.Left = $origin.X
-    $rect.Top = $origin.Y
-    $rect.Right = $origin.X + $clientWidth
-    $rect.Bottom = $origin.Y + $clientHeight
     $captureRegion = 'client'
-  } elseif (-not [WinUaeCaptureNative]::GetWindowRect($hWnd, [ref]$rect)) {
-    throw 'GetWindowRect failed for the WinUAE window.'
+    $cropLeft = [Math]::Max(0, $origin.X - $windowRect.Left)
+    $cropTop = [Math]::Max(0, $origin.Y - $windowRect.Top)
+    $cropWidth = [Math]::Max(1, $clientRect.Right - $clientRect.Left)
+    $cropHeight = [Math]::Max(1, $clientRect.Bottom - $clientRect.Top)
+    $clientScreenLeft = $origin.X
+    $clientScreenTop = $origin.Y
   }
 }
 
-$width = [Math]::Max(1, $rect.Right - $rect.Left)
-$height = [Math]::Max(1, $rect.Bottom - $rect.Top)
-$bitmap = New-Object System.Drawing.Bitmap($width, $height)
+$bestChildRect = $null
+$bestChildArea = 0
+$bestChildClass = ''
+
+$childCollector = [WinUaeCaptureNative+EnumWindowsProc]{
+  param([IntPtr]$childHwnd, [IntPtr]$lParam)
+
+  if (-not [WinUaeCaptureNative]::IsWindowVisible($childHwnd)) {
+    return $true
+  }
+
+  $childRect = New-Object WinUaeCaptureNative+RECT
+  if (-not [WinUaeCaptureNative]::GetWindowRect($childHwnd, [ref]$childRect)) {
+    return $true
+  }
+
+  $childWidth = $childRect.Right - $childRect.Left
+  $childHeight = $childRect.Bottom - $childRect.Top
+  if ($childWidth -le 32 -or $childHeight -le 32) {
+    return $true
+  }
+
+  $area = $childWidth * $childHeight
+  if ($area -le $bestChildArea) {
+    return $true
+  }
+
+  $classBuilder = New-Object System.Text.StringBuilder 256
+  [void][WinUaeCaptureNative]::GetClassName($childHwnd, $classBuilder, $classBuilder.Capacity)
+
+  $bestChildArea = $area
+  $bestChildRect = $childRect
+  $bestChildClass = $classBuilder.ToString()
+  return $true
+}
+
+[WinUaeCaptureNative]::EnumChildWindows($hWnd, $childCollector, [IntPtr]::Zero) | Out-Null
+
+if ($bestChildRect -ne $null) {
+  $captureRegion = 'client'
+  $cropLeft = [Math]::Max(0, $bestChildRect.Left - $windowRect.Left)
+  $cropTop = [Math]::Max(0, $bestChildRect.Top - $windowRect.Top)
+  $cropWidth = [Math]::Max(1, $bestChildRect.Right - $bestChildRect.Left)
+  $cropHeight = [Math]::Max(1, $bestChildRect.Bottom - $bestChildRect.Top)
+  $clientScreenLeft = $bestChildRect.Left
+  $clientScreenTop = $bestChildRect.Top
+}
+
+$bitmap = New-Object System.Drawing.Bitmap($windowWidth, $windowHeight)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
 function Test-MostlyBlackBitmap {
@@ -134,26 +206,51 @@ function Test-MostlyBlackBitmap {
 }
 
 $printed = $false
-try {
-  $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
-  $method = 'screen_copy'
-} catch {
+if ($captureRegion -ne 'client') {
   $hdc = $graphics.GetHdc()
   try {
     $printed = [WinUaeCaptureNative]::PrintWindow($hWnd, $hdc, 0)
   } finally {
     $graphics.ReleaseHdc($hdc)
   }
+}
 
-  if ($printed -and -not (Test-MostlyBlackBitmap -Bitmap $bitmap)) {
-    $method = 'printwindow'
-  } else {
-    throw
+if ($printed -and -not (Test-MostlyBlackBitmap -Bitmap $bitmap)) {
+  $method = 'printwindow'
+} else {
+  $bitmap.Dispose()
+  $graphics.Dispose()
+  $fallbackWidth = $windowWidth
+  $fallbackHeight = $windowHeight
+  $fallbackLeft = $windowRect.Left
+  $fallbackTop = $windowRect.Top
+  if ($captureRegion -eq 'client') {
+    $fallbackWidth = $cropWidth
+    $fallbackHeight = $cropHeight
+    $fallbackLeft = $clientScreenLeft
+    $fallbackTop = $clientScreenTop
+  }
+  $bitmap = New-Object System.Drawing.Bitmap($fallbackWidth, $fallbackHeight)
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $graphics.CopyFromScreen($fallbackLeft, $fallbackTop, 0, 0, $bitmap.Size)
+  $method = 'screen_copy'
+  if ($captureRegion -eq 'client') {
+    $windowWidth = $fallbackWidth
+    $windowHeight = $fallbackHeight
+    $cropLeft = 0
+    $cropTop = 0
   }
 }
 
+$outputBitmap = $bitmap
+if ($captureRegion -eq 'client') {
+  $cropRect = New-Object System.Drawing.Rectangle($cropLeft, $cropTop, $cropWidth, $cropHeight)
+  $outputBitmap = $bitmap.Clone($cropRect, $bitmap.PixelFormat)
+}
+
 $outPath = '${quotedPath}'
-$bitmap.Save($outPath, [System.Drawing.Imaging.ImageFormat]::Png)
+$outputBitmap.Save($outPath, [System.Drawing.Imaging.ImageFormat]::Png)
+$outputBitmap.Dispose()
 $graphics.Dispose()
 $bitmap.Dispose()
 
@@ -161,10 +258,15 @@ $bitmap.Dispose()
   filepath = $outPath
   processId = $proc.Id
   method = $method
-  width = $width
-  height = $height
+  width = $cropWidth
+  height = $cropHeight
   title = $proc.MainWindowTitle
   captureRegion = $captureRegion
+  sourceWidth = $windowWidth
+  sourceHeight = $windowHeight
+  cropLeft = $cropLeft
+  cropTop = $cropTop
+  childClass = $bestChildClass
 } | ConvertTo-Json -Compress
 `.trim();
 }

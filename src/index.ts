@@ -2282,7 +2282,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const outputFormat = args.output_format ?? 'png';
         let lastError: unknown = null;
 
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             const protocol = connection.getProtocol();
             const bitmapData = await protocol.readMemory(addr, request.bytesToRead);
@@ -2327,8 +2327,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             }
           } catch (error) {
             lastError = error;
-            if (attempt === 0 && isTransientWinUaeTransportError(error)) {
-              traceErr('winuae_bitmap_decode: transient transport error, retrying once', error);
+            if (isTransientWinUaeTransportError(error) && attempt < 2) {
+              traceErr(`winuae_bitmap_decode: transient transport error, retrying (${attempt + 1}/2)`, error);
               try {
                 if (connection?.connected) {
                   await connection.disconnect(false);
@@ -2338,7 +2338,19 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
               }
 
               trace('winuae_bitmap_decode: reconnecting WinUAE GDB session for retry (non-intrusive)');
-              await connection.connectExisting({ forceBreak: false, initializeStopped: false });
+              const previousAttempts = process.env.WINUAE_GDB_MAX_ATTEMPTS;
+              const previousDelay = process.env.WINUAE_GDB_DELAY_MS;
+              process.env.WINUAE_GDB_MAX_ATTEMPTS = process.env.WINUAE_GDB_RECONNECT_MAX_ATTEMPTS || '20';
+              process.env.WINUAE_GDB_DELAY_MS = process.env.WINUAE_GDB_RECONNECT_DELAY_MS || '500';
+              try {
+                await connection.connectExisting({ forceBreak: false, initializeStopped: false });
+              } finally {
+                if (previousAttempts === undefined) delete process.env.WINUAE_GDB_MAX_ATTEMPTS;
+                else process.env.WINUAE_GDB_MAX_ATTEMPTS = previousAttempts;
+                if (previousDelay === undefined) delete process.env.WINUAE_GDB_DELAY_MS;
+                else process.env.WINUAE_GDB_DELAY_MS = previousDelay;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 250));
               trace('winuae_bitmap_decode: retry connection established');
               continue;
             }
@@ -2401,12 +2413,16 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const protocol = connection.getProtocol();
         const sessionInfo = connection.getSessionInfo();
         let monitorError: string | null = null;
+        const screenshotTimeoutMs = Math.max(
+          5000,
+          parseInt(process.env.WINUAE_SCREENSHOT_TIMEOUT_MS || '30000', 10) || 30000
+        );
 
         const internalOnly = captureMode === 'monitor' || captureMode === 'internal';
         if (captureMode !== 'host_window') {
           try {
             const winPath = filepath.replace(/\//g, '\\');
-            const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, 15000);
+            const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, screenshotTimeoutMs);
             const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
             const sizeMatch = textReply.match(/OK\s+(\d+)x(\d+)/i);
             return {
@@ -2442,6 +2458,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
               width: windowCapture.width,
               height: windowCapture.height,
               title: windowCapture.title,
+              capture_region: windowCapture.captureRegion,
             }, null, 2),
           }],
         };
