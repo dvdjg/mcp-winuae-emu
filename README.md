@@ -16,16 +16,20 @@ This server lets an AI assistant (Claude, Cursor, etc.) help develop Amiga softw
 All via MCP tool calls, enabling the AI to run, test, and iterate on Amiga programs.
 
 Related project docs:
+- WinUAE-DBG (stub GDB, atribución Bartman/axewater/David, reglas RSP): [BARTMAN-VSCODE-Y-EVOLUCION.md](../WinUAE-DBG/doc/BARTMAN-VSCODE-Y-EVOLUCION.md#atribucion-bartman-vs-fork) (ruta típica si clonaste `WinUAE-DBG` junto a este repo; ajusta el prefijo si tu layout difiere).
 - Cursor-Amiga-C roadmap: [amiga-implementation-roadmap.md](../Cursor-Amiga-C/doc/amiga-implementation-roadmap.md)
 - Cursor-Amiga-C battery/spec: [amiga-test-battery-spec.md](../Cursor-Amiga-C/doc/amiga-test-battery-spec.md)
 
 ## Quick Start
 
-### 1. Download the pre-built WinUAE binary
+### 1. WinUAE binary: releases vs WinUAE-DBG build
 
-Download `winuae-gdb.exe` from the [WinUAE fork releases](https://github.com/axewater/WinUAE/releases) and place it in a directory (e.g., `C:\apps\winuae\`).
+You can use a **`winuae-gdb.exe`** from:
 
-This is a custom build of [BartmanAbyss's WinUAE fork](https://github.com/BartmanAbyss/WinUAE) with added register and memory write support. See the [patch details](https://github.com/axewater/WinUAE/blob/gdb-write-commands/HANDOVER.md).
+1. **[axewater/WinUAE releases](https://github.com/axewater/WinUAE/releases)** (or the branch described in [HANDOVER.md](https://github.com/axewater/WinUAE/blob/gdb-write-commands/HANDOVER.md)), or  
+2. **Your own build** from a **WinUAE-DBG** tree (this workspace’s `WinUAE-DBG` clone: same RSP stub family as the axewater fork; use that tree’s `build.bat` and `doc/BARTMAN-VSCODE-Y-EVOLUCION.md` for Bartman vs fork extensions and MCP compatibility notes).
+
+Point `WINUAE_PATH` at the directory that contains `winuae-gdb.exe`. The MCP server merges GDB-related CLI flags when launching; WinUAE **v4.10.x** expects `debugging_features=gdbserver` on the **command line** (see Technical notes at the end of this README).
 
 ### 2. Install the MCP server
 
