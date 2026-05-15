@@ -17,6 +17,8 @@
     "test:snapshot-live": "npm run build && node scripts/a-mcp-02-live.mjs",
     "test:screenshot-internal-live": "npm run build && node scripts/test-screenshot-internal-live.mjs",
     "test:pattern": "node dist/memory-pattern-search-selftest.js",
+    "test:amiga-c-bp": "node scripts/test-amiga-c-bp-vars-after-f5.mjs",
+    "test:amiga-c-step": "node scripts/test-amiga-c-step-after-f5.mjs",
     "test:session": "node dist/winuae-session-selftest.js",
     "test:snapshot": "node dist/machine-snapshot-selftest.js",
     "watch": "tsc --watch",
