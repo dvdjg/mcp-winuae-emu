@@ -15,6 +15,10 @@ This server lets an AI assistant (Claude, Cursor, etc.) help develop Amiga softw
 
 All via MCP tool calls, enabling the AI to run, test, and iterate on Amiga programs.
 
+**Guía "cuándo usar" (para IA):** `Amiga-Cpp/docs/debugging/DEBUG-WINUAE-V2-GUIDE.md`
+(inventario, síntoma→herramienta, periférico `0xB70000` + checkpoint profiler,
+verificación y limitaciones).
+
 Related project docs:
 - WinUAE-DBG (stub GDB, atribución Bartman/axewater/David, reglas RSP): [BARTMAN-VSCODE-Y-EVOLUCION.md](../WinUAE-DBG/doc/BARTMAN-VSCODE-Y-EVOLUCION.md#atribucion-bartman-vs-fork) (ruta típica si clonaste `WinUAE-DBG` junto a este repo; ajusta el prefijo si tu layout difiere).
 - Cursor-Amiga-C roadmap: [amiga-implementation-roadmap.md](../Cursor-Amiga-C/doc/amiga-implementation-roadmap.md)
