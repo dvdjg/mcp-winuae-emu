@@ -14,6 +14,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { SessionIdleAction, WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
 import { GdbProtocol, M68kRegisters, WatchpointType } from './gdb-protocol.js';
+import { sideChannelCommand } from './side-channel.js';
 import {
   buildCpuSnapshot,
   buildCustomRegisterSnapshot,
@@ -916,6 +917,102 @@ const tools: Tool[] = [
         },
       },
       required: ['address', 'length', 'type'],
+    },
+  },
+
+  // WinUAE-DBG v2.1 monitor extensions (e9k-style)
+  {
+    name: 'winuae_emulator_status',
+    description: 'Return emulator telemetry (cycles, frame, vpos/hpos, warp, baseText, breakpoint/watchpoint/protect counts, rewind). Useful to confirm the emulator is running and see global debug state. (WinUAE-DBG monitor status)',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'winuae_watchpoint_set_ext',
+    description: 'Set a watchpoint with predicates and source filter (extended). Breaks on memory access matching r/w, size, value, value-change and access source (cpu/copper/blitter/dma). Backed by WinUAE memwatch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        address: { type: ['string', 'number'], description: 'Start address (hex or decimal)' },
+        access: { type: 'string', enum: ['r', 'w', 'rw'], description: 'Access to watch (default rw)' },
+        size: { type: 'number', enum: [8, 16, 32], description: 'Watch size in bits (default 32)' },
+        value: { type: ['string', 'number'], description: 'Only break if accessed value matches this (hex or decimal)' },
+        mask: { type: ['string', 'number'], description: 'Value mask for the value comparison (default 0xffffffff)' },
+        must_change: { type: 'boolean', description: 'Only break if the value changes (old != new)' },
+        source: { type: 'string', enum: ['all', 'cpu', 'cpud', 'cpudw', 'cpudr', 'copper', 'blitter', 'dma', 'bpl', 'spr', 'audio', 'disk', 'bpl0', 'bpl1', 'bpl2', 'bpl3', 'bpl4', 'bpl5', 'bpl6', 'bpl7', 'spr0', 'spr1', 'spr2', 'spr3', 'spr4', 'spr5', 'spr6', 'spr7', 'audio0', 'audio1', 'audio2', 'audio3'], description: 'Filter by access source (default all)' },
+        reg: { type: ['string', 'number'], description: 'Only break if DMA register matches' },
+        pc: { type: ['string', 'number'], description: 'Only break if PC matches' },
+        nobreak: { type: 'boolean', description: 'Do not stop emulation, only log (reportonly)' },
+      },
+      required: ['address'],
+    },
+  },
+  {
+    name: 'winuae_watchpoint_last',
+    description: 'Return details of the last watchpoint that stopped the emulator (address, r/w, size, source, value, PC).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'winuae_watchpoint_list',
+    description: 'List active watchpoints and protects.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'winuae_watchpoint_clear_ext',
+    description: 'Clear watchpoints. Pass idx to remove one (from winuae_watchpoint_list) or all=true to clear every watchpoint.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        idx: { type: 'number', description: 'Watchpoint index to remove (from winuae_watchpoint_list)' },
+        all: { type: 'boolean', description: 'Clear all watchpoints' },
+      },
+    },
+  },
+  {
+    name: 'winuae_protect',
+    description: 'Memory protect/cheat: block writes to an address or force a value. Acts on accesses from the emulated program (CPU/blitter/copper/DMA) while it runs. Note: for 32-bit targets the 68000 writes as two 16-bit words; prefer size=16 for word writes and size=32 for whole-long writes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['block', 'set', 'list', 'clear', 'del'], description: 'block: prevent writes; set: force a value; list/clear/del: manage protects' },
+        address: { type: ['string', 'number'], description: 'Target address (hex or decimal) for block/set/del' },
+        value: { type: ['string', 'number'], description: 'Forced value for set (hex or decimal)' },
+        size: { type: 'number', enum: [8, 16, 32], description: 'Access size in bits (default 32)' },
+        source: { type: 'string', enum: ['all', 'cpu', 'cpud', 'cpudw', 'cpudr', 'copper', 'blitter', 'dma', 'bpl', 'spr', 'audio', 'disk', 'bpl0', 'bpl1', 'bpl2', 'bpl3', 'bpl4', 'bpl5', 'bpl6', 'bpl7', 'spr0', 'spr1', 'spr2', 'spr3', 'spr4', 'spr5', 'spr6', 'spr7', 'audio0', 'audio1', 'audio2', 'audio3'], description: 'Filter by access source (default all)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_rewind',
+    description: 'Rewind control (experimental). command=start enables WinUAE state capture (input recording in memory); stop disables it; status shows capture state. With no command, rewinds one frame — NOTE: the restore is fragile with GDB attached and may crash the emulator (pre-existing WinUAE issue); use in disposable sessions only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', enum: ['start', 'stop', 'status'], description: 'Sub-command (optional). start/stop/status manage state capture; omit to rewind one frame.' },
+      },
+    },
+  },
+  {
+    name: 'winuae_trace',
+    description: 'Control the WinUAE-DBG trace system. on/off toggles high-level tracing of watch/protect/rewind events (logged to %TEMP%\\winuae-gdb.log); status shows current state. Trace is enabled by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['on', 'off', 'status'], description: 'Toggle or query trace (default status)' },
+      },
+    },
+  },
+  {
+    name: 'winuae_side_read',
+    description: 'Read the WinUAE side channel (localhost:2346, independent of GDB). Useful when GDB is unavailable or inert (e.g. after a rewind restore). Commands: state (debugger state, pc, sr, cycles, sections), regs (D0-D7/A0-A7/SR/PC), mem <hex-addr> <len> (hex data), runstatus <hex-addr> (magic/state/frame/detail of a run-status symbol).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Side channel command, e.g. "state", "regs", "mem 40000 16", "runstatus 40000"' },
+        port: { type: 'number', description: 'Side channel port (default 2346)' },
+        timeout_ms: { type: 'number', description: 'Reply timeout in ms (default 4000)' },
+      },
+      required: ['command'],
     },
   },
 
@@ -2129,6 +2226,126 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const protocol = connection.getProtocol();
         await protocol.clearWatchpoint(addr, length, type as WatchpointType);
         return { content: [{ type: 'text', text: `Watchpoint (${type}) cleared at ${hex32(addr)}` }] };
+      }
+
+      // ── WinUAE-DBG v2.1 monitor extensions (e9k-style) ────────────────
+      case 'winuae_emulator_status': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const reply = await protocol.sendMonitorCommand('status', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        const parsed: Record<string, string> = {};
+        for (const line of text.split('\n')) {
+          const m = line.match(/^([A-Za-z_][A-Za-z_0-9]*)=(.*)$/);
+          if (m) parsed[m[1]] = m[2];
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }] };
+      }
+
+      case 'winuae_watchpoint_set_ext': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const addr = parseHexOrDecimal(args.address);
+        const access = args.access ?? 'rw';
+        const size = args.size ?? 32;
+        let cmd = `watch ${addr.toString(16)} ${access} size=${size}`;
+        if (args.mask !== undefined) cmd += ` mask=0x${parseHexOrDecimal(args.mask).toString(16)}`;
+        if (args.value !== undefined) cmd += ` val=0x${parseHexOrDecimal(args.value).toString(16)}`;
+        if (args.must_change) cmd += ' diff';
+        if (args.source) cmd += ` src=${args.source}`;
+        if (args.reg !== undefined) cmd += ` reg=0x${parseHexOrDecimal(args.reg).toString(16)}`;
+        if (args.pc !== undefined) cmd += ` pc=0x${parseHexOrDecimal(args.pc).toString(16)}`;
+        if (args.nobreak) cmd += ' nobreak';
+        const reply = await protocol.sendMonitorCommand(cmd, 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_watchpoint_last': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const reply = await protocol.sendMonitorCommand('watch last', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_watchpoint_list': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const reply = await protocol.sendMonitorCommand('watch list', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_watchpoint_clear_ext': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const cmd = args.all || args.idx === undefined ? 'watch clear' : `watch del ${args.idx}`;
+        const reply = await protocol.sendMonitorCommand(cmd, 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_protect': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const { action } = args;
+        const size = args.size ?? 32;
+        const source = args.source ?? 'all';
+        let cmd: string;
+        if (action === 'list') {
+          cmd = 'protect list';
+        } else if (action === 'clear') {
+          cmd = 'protect clear';
+        } else if (action === 'del') {
+          const addr = parseHexOrDecimal(args.address);
+          cmd = `protect del ${addr.toString(16)} size=${size}`;
+        } else if (action === 'block') {
+          const addr = parseHexOrDecimal(args.address);
+          cmd = `protect ${addr.toString(16)} block size=${size} src=${source}`;
+        } else if (action === 'set') {
+          if (args.value === undefined) throw new Error('value is required for set');
+          const addr = parseHexOrDecimal(args.address);
+          const value = parseHexOrDecimal(args.value);
+          cmd = `protect ${addr.toString(16)} set=0x${value.toString(16)} size=${size} src=${source}`;
+        } else {
+          throw new Error(`Unknown protect action: ${action}`);
+        }
+        const reply = await protocol.sendMonitorCommand(cmd, 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_rewind': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const cmd = args.command ? `rewind ${args.command}` : 'rewind';
+        const reply = await protocol.sendMonitorCommand(cmd, 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_trace': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const action = args.action ?? 'status';
+        const reply = await protocol.sendMonitorCommand(`trace ${action}`, 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_side_read': {
+        const cmd = String(args.command ?? '').trim();
+        if (!cmd) throw new Error('command is required');
+        const port = Number(args.port ?? 2346);
+        const timeoutMs = Number(args.timeout_ms ?? 4000);
+        const result = await sideChannelCommand(cmd, port, timeoutMs);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(result.ok && result.reply ? result.reply : { ok: result.ok, command: result.command, raw: result.raw, error: result.error }, null, 2),
+          }],
+        };
       }
 
       case 'winuae_step': {

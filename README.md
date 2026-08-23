@@ -128,6 +128,15 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_breakpoint_conditional_wait` | Software-assisted conditional breakpoint helper that evaluates register/custom/memory predicates on each stop until one matches. |
 | `winuae_watchpoint_set` | Break on memory read/write/access |
 | `winuae_watchpoint_clear` | Remove a watchpoint |
+| `winuae_watchpoint_set_ext` | **WinUAE-DBG v2.1**: watchpoint with predicates and source filter (`src=cpu|copper|blitter|dma`, `value`, `mask`, `must_change`, `reg`, `pc`, `nobreak`). Uses WinUAE memwatch. |
+| `winuae_watchpoint_list` | **v2.1**: list active watchpoints and protects |
+| `winuae_watchpoint_last` | **v2.1**: details of the last watchpoint hit (addr, r/w, size, source, value, PC) |
+| `winuae_watchpoint_clear_ext` | **v2.1**: clear one watchpoint by index or all (`all=true`) |
+| `winuae_emulator_status` | **v2.1**: emulator telemetry (cycles, frame, vpos/hpos, warp, baseText, bp/wp/protect counts, rewind state) |
+| `winuae_protect` | **v2.1**: memory protect/cheat — `block` writes to an address or `set` a forced value (acts on accesses from the emulated program while running) |
+| `winuae_rewind` | **v2.1**: rewind control — `start`/`stop`/`status` manage state capture; with no command, rewinds one frame (restore no longer crashes; GDB session may become unresponsive after a restore) |
+| `winuae_trace` | **v2.1**: control the trace system (`on`/`off`/`status`); logs watch/protect/rewind events to `%TEMP%\winuae-gdb.log` |
+| `winuae_side_read` | **v2.1**: read the WinUAE side channel (port 2346, independent of GDB): `state` / `regs` / `mem <addr> <len>` / `runstatus <addr>`. Useful when GDB is unavailable/inert (e.g. after a rewind restore) to inspect a restored snapshot |
 
 ### Amiga Hardware (core tools)
 
@@ -235,6 +244,7 @@ There are no separate “gfx_state”, “audio_state”, “bitmap_read”, “
 ## Limitations
 
 - **Windows only** -- requires WinUAE
+- **x64 build of WinUAE-DBG**: the x64 binary has a **pre-existing** issue (not caused by the v2.1 monitor extensions): during boot with a GDB client connected, the server does not respond to the handshake and may crash in the JIT/`compemu_support` region (access violation at `0x4002xxxx`). Use the **x86** build (`winuae-gdb.exe`, the default). See `WinUAE-DBG/docs/WINUAE-MONITOR-EXTENSIONS.md` for details.
 - **Basic disassembly** -- the disassembler only recognizes a few opcodes (RTS, NOP, RTE, etc.); all others show as `DC.W`
 - **No CIA access** -- CIA-A/CIA-B registers are not mapped through the GDB server
 - **Single connection** -- the GDB server accepts one client at a time
