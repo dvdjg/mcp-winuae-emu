@@ -1015,6 +1015,16 @@ const tools: Tool[] = [
       required: ['command'],
     },
   },
+  {
+    name: 'winuae_debugperiph',
+    description: 'Control/query the debug peripheral mapped at 0xB70000 (e9k-style "Amiga Debug Peripherals"): the emulated program can self-instrument via console output (0xB70000), breakpoint requests (0xB70004), section bases, checkpoints (0xB70020), debug args (0xB7E900..) and a CPU cycle counter (0xB7E928). With no args returns status; `arg <n> <value>` sets a debug arg; `console` shows buffered console text; `checkpoints` dumps recorded checkpoints; `flush` flushes the console.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Sub-command: (empty)=status, "arg <n> <value>", "console", "checkpoints", "flush"' },
+      },
+    },
+  },
 
   // Execution control
   {
@@ -2346,6 +2356,15 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             text: JSON.stringify(result.ok && result.reply ? result.reply : { ok: result.ok, command: result.command, raw: result.raw, error: result.error }, null, 2),
           }],
         };
+      }
+
+      case 'winuae_debugperiph': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const cmd = String(args.command ?? '').trim();
+        const reply = await protocol.sendMonitorCommand(cmd ? `debugperiph ${cmd}` : 'debugperiph', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
       }
 
       case 'winuae_step': {

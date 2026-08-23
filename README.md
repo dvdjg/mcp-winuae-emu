@@ -137,6 +137,7 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_rewind` | **v2.1**: rewind control — `start`/`stop`/`status` manage state capture; with no command, rewinds one frame (restore no longer crashes; GDB session may become unresponsive after a restore) |
 | `winuae_trace` | **v2.1**: control the trace system (`on`/`off`/`status`); logs watch/protect/rewind events to `%TEMP%\winuae-gdb.log` |
 | `winuae_side_read` | **v2.1**: read the WinUAE side channel (port 2346, independent of GDB): `state` / `regs` / `mem <addr> <len>` / `runstatus <addr>`. Useful when GDB is unavailable/inert (e.g. after a rewind restore) to inspect a restored snapshot |
+| `winuae_debugperiph` | **v2.1**: query/control the debug peripheral at `0xB70000` (console, cycle counter, debug args, checkpoints, section bases) — the emulated program self-instruments there; `arg <n> <value>` sets a debug arg |
 
 ### Amiga Hardware (core tools)
 

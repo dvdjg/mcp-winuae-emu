@@ -109,6 +109,17 @@ try {
   console.log(sr3.slice(0, 160));
   check(sr3.includes('"d0"'), 'winuae_side_read regs', sr3);
 
+  console.log('\n== winuae_debugperiph ==');
+  const dp = await callTool('winuae_debugperiph');
+  console.log(dp.slice(0, 160));
+  check(dp.includes('mapped=1'), 'winuae_debugperiph status', dp);
+  const dpArg = await callTool('winuae_debugperiph', { command: 'arg 1 0xbeef' });
+  console.log(dpArg);
+  check(dpArg.startsWith('OK debug arg'), 'winuae_debugperiph arg', dpArg);
+  const dpCyc = await callTool('winuae_side_read', { command: 'mem b7e928 4' });
+  console.log(dpCyc.slice(0, 120));
+  check(dpCyc.includes('"data"'), 'winuae_debugperiph ciclo (0xB7E928)', dpCyc);
+
   console.log('\n== winuae_disconnect ==');
   try { console.log((await callTool('winuae_disconnect', { stop_emulator: false })).slice(0, 200)); } catch (e) { console.log('disconnect:', e.message); }
 
