@@ -58,6 +58,7 @@ import {
 import { captureWinUAEWindow } from './winuae-window-capture.js';
 import { trace, traceErr } from './trace.js';
 import * as path from 'path';
+import fs from 'fs';
 
 // ─── Configuration from environment ──────────────────────────────────
 
@@ -1045,6 +1046,19 @@ const tools: Tool[] = [
       properties: {
         command: { type: 'string', description: '"<from> <to> [size=8|16|32]", "ignore", "clear"' },
       },
+    },
+  },
+  {
+    name: 'winuae_print',
+    description: 'Print a value from emulated memory (e9k-style). Accepts an address (`0x...`) or a symbol resolved via the demo `.map` (mapPath). `size` selects 8/16/32 bits. With `deref:true` treats the value as a pointer and prints what it points to. Resolution: linked symbol -> runtime via the section bases (monitor base).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        expr: { type: 'string', description: 'Address (0x...) or symbol name (requires mapPath). Prefix * for dereference.' },
+        size: { type: 'number', enum: [8, 16, 32], description: 'Access size (default 32)' },
+        mapPath: { type: 'string', description: 'Path to the demo .map to resolve symbols (e.g. out/demos/101_ehb_tile_scroll_driver/101_ehb_tile_scroll_driver.map)' },
+      },
+      required: ['expr'],
     },
   },
   {
@@ -2401,6 +2415,55 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const protocol = connection.getProtocol();
         const cmd = String(args.command ?? '').trim();
         const reply = await protocol.sendMonitorCommand(cmd ? `train ${cmd}` : 'train', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_print': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        let expr = String(args.expr ?? '').trim();
+        const size = Number(args.size ?? 32);
+        const mapPath = args.mapPath ? String(args.mapPath) : '';
+        const deref = expr.startsWith('*');
+        if (deref) expr = expr.slice(1).trim();
+        const isAddr = /^0x[0-9a-fA-F]+$/.test(expr);
+        if (!isAddr) {
+          if (!mapPath || !fs.existsSync(mapPath)) {
+            throw new Error(`Symbol "${expr}" requires mapPath (path to the demo .map)`);
+          }
+          // resolver simbolo: linked -> runtime via secciones (igual que run-demo)
+          const baseReply = await protocol.sendMonitorCommand('base', 10000);
+          const baseText = Buffer.from(baseReply, 'hex').toString('utf8');
+          const runtimeSections: number[] = [];
+          for (const raw of baseText.split(/\r?\n/g)) {
+            const m = /^sec(\d+)=0x([0-9a-fA-F]+)/.exec(raw.trim());
+            if (m) runtimeSections[parseInt(m[1], 10)] = parseInt(m[2], 16);
+          }
+          const mapSections: { name: string; start: number; size: number }[] = [];
+          for (const raw of fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g)) {
+            const m = /^\.(text|rodata|data|bss)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)/.exec(raw);
+            if (!m) continue;
+            const size2 = parseInt(m[3], 16);
+            if (size2 === 0) continue;
+            mapSections.push({ name: m[1], start: parseInt(m[2], 16), size: size2 });
+          }
+          let linked = -1;
+          for (const raw of fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g)) {
+            const m = new RegExp(`^\\s*0x([0-9a-fA-F]+)\\s+${expr}\\b`).exec(raw);
+            if (m) { linked = parseInt(m[1], 16); break; }
+          }
+          if (linked < 0) throw new Error(`Symbol "${expr}" not found in ${mapPath}`);
+          const idx = mapSections.findIndex(s => linked >= s.start && linked < s.start + s.size);
+          const runtimeBase = (idx >= 0 && runtimeSections[idx]) ? runtimeSections[idx]
+            : (runtimeSections[0] ?? 0);
+          if (!runtimeBase) throw new Error('Section base is 0; set it with winuae_base or query after the demo loads');
+          const secStart = idx >= 0 ? mapSections[idx].start : 0x400;
+          const runtime = runtimeBase + (linked - secStart);
+          expr = `0x${runtime.toString(16)}`;
+        }
+        const cmd = `print ${deref ? '*' : ''}${expr} size=${size}`;
+        const reply = await protocol.sendMonitorCommand(cmd, 10000);
         const text = Buffer.from(reply, 'hex').toString('utf8');
         return { content: [{ type: 'text', text: text.trim() }] };
       }
