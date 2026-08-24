@@ -1028,6 +1028,26 @@ const tools: Tool[] = [
 
   // Execution control
   {
+    name: 'winuae_base',
+    description: 'Query/set runtime section bases (text/data/bss) for symbol resolution (e9k-style `monitor base`). With no args returns the current bases; `text|data|bss <addr>` sets one; `text|data|bss clear` or `clear` clears.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Sub-command: (empty)=query, "text|data|bss <addr|clear>", "clear"' },
+      },
+    },
+  },
+  {
+    name: 'winuae_train',
+    description: 'e9k-style train: break when a write changes a value from <from> to <to> at ANY address (`monitor train`). `ignore` adds the last triggered address to the ignore list; `clear` empties it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '"<from> <to> [size=8|16|32]", "ignore", "clear"' },
+      },
+    },
+  },
+  {
     name: 'winuae_step',
     description: 'Single-step N instructions. Returns registers after stepping.',
     inputSchema: {
@@ -2363,6 +2383,24 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const protocol = connection.getProtocol();
         const cmd = String(args.command ?? '').trim();
         const reply = await protocol.sendMonitorCommand(cmd ? `debugperiph ${cmd}` : 'debugperiph', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_base': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const cmd = String(args.command ?? '').trim();
+        const reply = await protocol.sendMonitorCommand(cmd ? `base ${cmd}` : 'base', 10000);
+        const text = Buffer.from(reply, 'hex').toString('utf8');
+        return { content: [{ type: 'text', text: text.trim() }] };
+      }
+
+      case 'winuae_train': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        const cmd = String(args.command ?? '').trim();
+        const reply = await protocol.sendMonitorCommand(cmd ? `train ${cmd}` : 'train', 10000);
         const text = Buffer.from(reply, 'hex').toString('utf8');
         return { content: [{ type: 'text', text: text.trim() }] };
       }
