@@ -2477,6 +2477,24 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             }
           }
           if (linked < 0) {
+            // fallback: secciones por-objeto del .map (.data._ZN...NnL6g_gameE -> g_game)
+            const demangleVar = (mangled: string): string | null => {
+              const m = /_Z.*?(\d+)([A-Za-z_][A-Za-z0-9_]*?)E?$/.exec(mangled);
+              if (!m) return null;
+              const len = parseInt(m[1], 10);
+              return m[2].slice(0, len) || null;
+            };
+            const mapLines = fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g);
+            for (let i = 0; i < mapLines.length; i++) {
+              const sec = /^\s+\.(?:data|text|rodata|bss)\.(\S+)\s*$/.exec(mapLines[i]);
+              if (!sec) continue;
+              const addrLine = /^\s*0x([0-9a-fA-F]+)\s+0x/.exec(mapLines[i + 1] ?? '');
+              if (!addrLine) continue;
+              const varName = demangleVar(sec[1]);
+              if (varName === base) { linked = parseInt(addrLine[1], 16); break; }
+            }
+          }
+          if (linked < 0) {
             for (const raw of fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g)) {
               const m = new RegExp(`^\\s*0x([0-9a-fA-F]+)\\s+${base}\\b`).exec(raw);
               if (m) { linked = parseInt(m[1], 16); break; }

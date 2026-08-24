@@ -264,6 +264,17 @@ export class DwarfReader {
     return null;
   }
 
+  /** Busca un tipo (struct/class/union) por nombre (p. ej. 'RunStatus'). */
+  findType(name: string): Die | null {
+    for (const die of this.dies.values()) {
+      if (die.tag === DW_TAG_structure_type || die.tag === DW_TAG_class_type || die.tag === DW_TAG_union_type) {
+        const n = this.dieName(die);
+        if (n === name || n.endsWith('::' + name)) return die;
+      }
+    }
+    return null;
+  }
+
   resolveRef(value: any): Die | null {
     return this.dies.get(Number(value)) || null;
   }
