@@ -2479,7 +2479,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
           if (linked < 0) {
             // fallback: secciones por-objeto del .map (.data._ZN...NnL6g_gameE -> g_game)
             const demangleVar = (mangled: string): string | null => {
-              const m = /_Z.*?(\d+)([A-Za-z_][A-Za-z0-9_]*?)E?$/.exec(mangled);
+              const m = /(?:.*)(\d+)([A-Za-z_][A-Za-z0-9_]*?)E?$/.exec(mangled);
               if (!m) return null;
               const len = parseInt(m[1], 10);
               return m[2].slice(0, len) || null;
