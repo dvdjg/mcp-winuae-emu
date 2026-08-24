@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * E2E de `winuae_print` con campos de struct via DWARF.
  *
@@ -84,7 +84,7 @@ try {
   // esperar secciones (REFRESH_OFFSETS tras boot ~25s)
   console.log('Esperando carga de la demo (REFRESH_OFFSETS)...');
   let bases = '';
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 90; i++) {
     bases = await mon(p, 'base', 2000).catch(() => '');
     if (/sec\d+=0x[0-9a-fA-F]{8}/.test(bases) && !/sec0=0x00000000/.test(bases)) break;
     await sleep(500);
@@ -140,3 +140,4 @@ try {
 } finally {
   try { await conn.disconnect(true); } catch { /* noop */ }
 }
+

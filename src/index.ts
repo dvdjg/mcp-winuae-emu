@@ -2523,10 +2523,18 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
                 addr += m.offset;
                 typeDie = m.typeDie;
               } else {
-                if (rt.kind !== 'array') throw new Error(`[${part.value}] sobre tipo no-array`);
-                const es = rt.elementSize ?? 2;
-                addr += (part.value as number) * es;
-                typeDie = rt.die;
+                // [N]: array; si el tipo no se resuelve como array, usamos el
+                // tamano del elemento (si lo sabemos) o 2 (u16 por defecto)
+                if (rt.kind === 'array' && rt.elementSize) {
+                  addr += (part.value as number) * rt.elementSize;
+                } else if (rt.kind === 'array' && rt.arrayCount && rt.size) {
+                  addr += (part.value as number) * Math.max(1, Math.floor(rt.size / rt.arrayCount));
+                } else if (rt.kind === 'struct' && rt.size) {
+                  addr += (part.value as number) * rt.size;
+                } else {
+                  addr += (part.value as number) * 2;
+                }
+                typeDie = rt.die ?? typeDie;
               }
             }
             const finalType = dr.resolveType(typeDie);
