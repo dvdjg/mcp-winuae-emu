@@ -104,6 +104,20 @@ try {
     pass('T6 consola+args regresion', `arg1=0x${arg.toString(16)}`);
   else fail('T6 consola+args regresion', `arg=0x${arg.toString(16)} log=${gdbLog().split('\n').filter(l => l.includes('EXT_OK')).length}`);
 
+  // T7: checkpoint profiler stats (seg_avg/min/max + scan)
+  await mon(p, 'debugperiph checkpoints reset');
+  await p.writeMemory(0xB70020, Buffer.from([0, 0, 0, 0])); // slot 0 (primero: no segmento)
+  await p.continue(); await sleep(120); await p.pause();
+  await p.writeMemory(0xB70020, Buffer.from([0, 0, 0, 7])); // slot 7 (segmento desde slot 0)
+  await p.continue(); await sleep(120); await p.pause();
+  await p.writeMemory(0xB70020, Buffer.from([0, 0, 0, 0])); // slot 0 otra vez -> segmento
+  const cp2 = await mon(p, 'debugperiph checkpoints');
+  const cp0line = cp2.split('\n').find(l => l.includes('[0]')) || '';
+  const hasSeg = /seg_avg=[1-9][0-9]*/.test(cp0line) && /seg_min=[1-9][0-9]*/.test(cp0line) && /scan_avg=[0-9]+/.test(cp0line);
+  if (cp0line.includes('[0]') && hasSeg)
+    pass('T7 checkpoint profiler stats', cp0line.trim());
+  else fail('T7 checkpoint profiler stats', cp2.split('\n').slice(0, 3).join(' | '));
+
   console.log('\n============================================');
   console.log(`RESULTADO: PASS ${results.passed.length} | FAIL ${results.failed.length}`);
   process.exit(results.failed.length ? 1 : 0);
