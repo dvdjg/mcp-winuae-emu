@@ -142,6 +142,9 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_trace` | **v2.1**: control the trace system (`on`/`off`/`status`); logs watch/protect/rewind events to `%TEMP%\winuae-gdb.log` |
 | `winuae_side_read` | **v2.1**: read the WinUAE side channel (port 2346, independent of GDB): `state` / `regs` / `mem <addr> <len>` / `runstatus <addr>`. Useful when GDB is unavailable/inert (e.g. after a rewind restore) to inspect a restored snapshot |
 | `winuae_debugperiph` | **v2.1**: query/control the debug peripheral at `0xB70000` (console, cycle counter, debug args, checkpoints, section bases) — the emulated program self-instruments there; `arg <n> <value>` sets a debug arg |
+| `winuae_base` | **v2.2**: query/set runtime section bases (`text`/`data`/`bss`) for symbol resolution (`monitor base`) — e9k-style |
+| `winuae_train` | **v2.2**: break when a write changes a value `from→to` at ANY address + ignore list (`monitor train`) — e9k-style |
+| `winuae_print` | **v2.2**: print a value from emulated memory (`monitor print`); with `mapPath` resolves a symbol and **simple struct fields via DWARF** of the `.elf` (e.g. `g_game.m_scene.m_scroll_x`, arrays `[N]`, deref). Offline resolution verified by `scripts/verify-dwarf.mjs` |
 
 ### Amiga Hardware (core tools)
 
