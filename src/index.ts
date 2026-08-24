@@ -2425,14 +2425,29 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         let expr = String(args.expr ?? '').trim();
         const size = Number(args.size ?? 32);
         const mapPath = args.mapPath ? String(args.mapPath) : '';
-        const deref = expr.startsWith('*');
+        let deref = expr.startsWith('*');
         if (deref) expr = expr.slice(1).trim();
         const isAddr = /^0x[0-9a-fA-F]+$/.test(expr);
         if (!isAddr) {
           if (!mapPath || !fs.existsSync(mapPath)) {
             throw new Error(`Symbol "${expr}" requires mapPath (path to the demo .map)`);
           }
-          // resolver simbolo: linked -> runtime via secciones (igual que run-demo)
+          // parsear simbolo base + camino (.member / [N])
+          const pathParts: { kind: 'member' | 'index'; value: string | number }[] = [];
+          let base = expr;
+          const mm = /^([A-Za-z_][A-Za-z0-9_]*)(.*)$/.exec(expr);
+          if (mm) {
+            base = mm[1];
+            let rest = mm[2];
+            while (rest.length) {
+              const mbr = /^\.([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
+              const idx = /^\[(\d+)\]/.exec(rest);
+              if (mbr) { pathParts.push({ kind: 'member', value: mbr[1] }); rest = rest.slice(mbr[0].length); }
+              else if (idx) { pathParts.push({ kind: 'index', value: parseInt(idx[1], 10) }); rest = rest.slice(idx[0].length); }
+              else break;
+            }
+          }
+          // resolver la base (linked -> runtime) via .map + secciones
           const baseReply = await protocol.sendMonitorCommand('base', 10000);
           const baseText = Buffer.from(baseReply, 'hex').toString('utf8');
           const runtimeSections: number[] = [];
@@ -2448,21 +2463,62 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
             if (size2 === 0) continue;
             mapSections.push({ name: m[1], start: parseInt(m[2], 16), size: size2 });
           }
+          // linked address: preferir DW_AT_location del DIE (DW_OP_addr) sobre el .map
           let linked = -1;
-          for (const raw of fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g)) {
-            const m = new RegExp(`^\\s*0x([0-9a-fA-F]+)\\s+${expr}\\b`).exec(raw);
-            if (m) { linked = parseInt(m[1], 16); break; }
+          let variableDie: any = null;
+          if (pathParts.length || true) {
+            const elfPath = mapPath.replace(/\.map$/, '.elf');
+            if (fs.existsSync(elfPath)) {
+              const { DwarfReader } = await import('./dwarf.js');
+              const dr2 = new DwarfReader(elfPath);
+              dr2.parse();
+              variableDie = dr2.findVariable(base);
+              if (variableDie) { const la = dr2.variableAddress(variableDie); if (la !== null) linked = la; }
+            }
           }
-          if (linked < 0) throw new Error(`Symbol "${expr}" not found in ${mapPath}`);
+          if (linked < 0) {
+            for (const raw of fs.readFileSync(mapPath, 'utf8').split(/\r?\n/g)) {
+              const m = new RegExp(`^\\s*0x([0-9a-fA-F]+)\\s+${base}\\b`).exec(raw);
+              if (m) { linked = parseInt(m[1], 16); break; }
+            }
+          }
+          if (linked < 0) throw new Error(`Symbol "${base}" no resuelto (ni DWARF ni .map)`);
           const idx = mapSections.findIndex(s => linked >= s.start && linked < s.start + s.size);
-          const runtimeBase = (idx >= 0 && runtimeSections[idx]) ? runtimeSections[idx]
-            : (runtimeSections[0] ?? 0);
+          const runtimeBase = (idx >= 0 && runtimeSections[idx]) ? runtimeSections[idx] : (runtimeSections[0] ?? 0);
           if (!runtimeBase) throw new Error('Section base is 0; set it with winuae_base or query after the demo loads');
           const secStart = idx >= 0 ? mapSections[idx].start : 0x400;
-          const runtime = runtimeBase + (linked - secStart);
-          expr = `0x${runtime.toString(16)}`;
+          let addr = runtimeBase + (linked - secStart);
+
+          // caminar miembros/index con DWARF si hay path
+          if (pathParts.length) {
+            const elfPath = mapPath.replace(/\.map$/, '.elf');
+            if (!fs.existsSync(elfPath)) throw new Error(`No .elf para resolver miembros: ${elfPath}`);
+            const { DwarfReader } = await import('./dwarf.js');
+            const dr = new DwarfReader(elfPath);
+            dr.parse();
+            let typeDie = variableDie ? (() => { const t = variableDie.attrs.get(0x49); return t ? dr.resolveRef(t.value) : null; })() : null;
+            for (const part of pathParts) {
+              const rt = dr.resolveType(typeDie);
+              if (part.kind === 'member') {
+                const m = rt.members.find(x => x.name === part.value);
+                if (!m) throw new Error(`Campo "${part.value}" no existe`);
+                addr += m.offset;
+                typeDie = m.typeDie;
+              } else {
+                if (rt.kind !== 'array') throw new Error(`[${part.value}] sobre tipo no-array`);
+                const es = rt.elementSize ?? 2;
+                addr += (part.value as number) * es;
+                typeDie = rt.die;
+              }
+            }
+            const finalType = dr.resolveType(typeDie);
+            const effSize = finalType.size && finalType.size <= 4 ? finalType.size : 4;
+            expr = `0x${addr.toString(16)} size=${finalType.size === 1 ? 8 : finalType.size === 2 ? 16 : effSize * 8}`;
+          } else {
+            expr = `0x${addr.toString(16)}`;
+          }
         }
-        const cmd = `print ${deref ? '*' : ''}${expr} size=${size}`;
+        const cmd = `print ${deref ? '*' : ''}${expr.split(' size=')[0]}${expr.includes('size=') ? '' : ` size=${size}`}`;
         const reply = await protocol.sendMonitorCommand(cmd, 10000);
         const text = Buffer.from(reply, 'hex').toString('utf8');
         return { content: [{ type: 'text', text: text.trim() }] };
