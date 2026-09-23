@@ -180,11 +180,19 @@ export class WinUAEConnection {
     trace(`Launching ${exePath} ${args.join(' ')}`);
     trace(`GDB port: ${this.config.gdbPort}, log: ${this.logFilePath}`);
     
+    // El gdbserver del fork lee el puerto de `WINUAE_GDB_PORT` (barto_gdbserver.cpp,
+    // default 2345). Se lo pasamos EXPLICITAMENTE al proceso del emulador para que
+    // escuche donde el cliente va a conectar, y permita varias instancias en puertos
+    // distintos. Idem el canal lateral.
     const spawnedProcess = spawn(exePath, args, {
       stdio: ['ignore', logFd, logFd],
       detached: false,
       cwd: launchCwd,
       windowsHide: headless,
+      env: {
+        ...process.env,
+        WINUAE_GDB_PORT: String(this.config.gdbPort || 2345),
+      },
     });
     this.process = spawnedProcess;
 
