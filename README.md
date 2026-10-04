@@ -63,6 +63,28 @@ Add to your MCP settings (`~/.claude/claude_desktop_config.json` or project `.mc
 }
 ```
 
+For **opencode**, add to `opencode.json` (project root or `~/.config/opencode/opencode.json`). Note `type: "local"` and `command` as an **array**:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "winuae-emu": {
+      "type": "local",
+      "command": ["node", "C:/path/to/mcp-winuae-emu/dist/index.js"],
+      "environment": {
+        "WINUAE_PATH": "C:/path/to/WinUAE-DBG/bin",
+        "WINUAE_CONFIG": "C:/path/to/mcp-amiga-c-debug.uae",
+        "WINUAE_GDB_PORT": "2345",
+        "WINUAE_SIDE_CHANNEL_PORT": "2346"
+      }
+    }
+  }
+}
+```
+
+Point `WINUAE_PATH` at the directory containing `winuae-gdb.exe` — ideally the **WinUAE-DBG build** (`WinUAE-DBG/bin`), which provides the side channel and the configurable GDB port. Use a distinct `WINUAE_GDB_PORT`/`WINUAE_SIDE_CHANNEL_PORT` pair per agent/instance so several debug sessions can coexist.
+
 ### 4. Provide a Kickstart ROM and config
 
 You need a valid Amiga Kickstart ROM file (e.g., Kickstart 1.3 for A500) and a WinUAE `.uae` config file. A minimal config:
