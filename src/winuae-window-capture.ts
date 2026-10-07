@@ -60,6 +60,12 @@ public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
   [DllImport("user32.dll")]
   public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, int nFlags);
 
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+
+  [DllImport("user32.dll")]
+  public static extern bool SetProcessDPIAware();
+
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
   [DllImport("user32.dll")]
@@ -129,6 +135,7 @@ if ([WinUaeCaptureNative]::GetClientRect($hWnd, [ref]$clientRect)) {
 $bestChildRect = $null
 $bestChildArea = 0
 $bestChildClass = ''
+$bestChildHwnd = [IntPtr]::Zero
 
 $childCollector = [WinUaeCaptureNative+EnumWindowsProc]{
   param([IntPtr]$childHwnd, [IntPtr]$lParam)
@@ -159,6 +166,7 @@ $childCollector = [WinUaeCaptureNative+EnumWindowsProc]{
   $bestChildArea = $area
   $bestChildRect = $childRect
   $bestChildClass = $classBuilder.ToString()
+  $bestChildHwnd = $childHwnd
   return $true
 }
 
@@ -173,9 +181,6 @@ if ($bestChildRect -ne $null) {
   $clientScreenLeft = $bestChildRect.Left
   $clientScreenTop = $bestChildRect.Top
 }
-
-$bitmap = New-Object System.Drawing.Bitmap($windowWidth, $windowHeight)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
 function Test-MostlyBlackBitmap {
   param(
@@ -205,41 +210,70 @@ function Test-MostlyBlackBitmap {
   return (($dark / $samples) -ge 0.95)
 }
 
-$printed = $false
-if ($captureRegion -ne 'client') {
-  $hdc = $graphics.GetHdc()
-  try {
-    $printed = [WinUaeCaptureNative]::PrintWindow($hWnd, $hdc, 0)
-  } finally {
-    $graphics.ReleaseHdc($hdc)
+# DPI: que GetWindowRect/ClientToScreen y CopyFromScreen compartan escala.
+[void][WinUaeCaptureNative]::SetProcessDPIAware()
+
+# PrintWindow con PW_CLIENTONLY|PW_RENDERFULLCONTENT (0x3): captura el contenido del window
+# sin depender del foco/z-order. Era el fallo: en modo 'client' NI SE INTENTABA y el
+# fallback copiaba la pantalla en coordenadas equivocadas.
+function Capture-WithPrintWindow {
+  param([IntPtr]$hwnd, [int]$width, [int]$height)
+  $bmp = New-Object System.Drawing.Bitmap($width, $height)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $hdc = $g.GetHdc()
+  try { $ok = [WinUaeCaptureNative]::PrintWindow($hwnd, $hdc, 3) } finally { $g.ReleaseHdc($hdc) }
+  if (-not $ok -or (Test-MostlyBlackBitmap -Bitmap $bmp)) {
+    $g.Dispose(); $bmp.Dispose(); return $null
   }
+  return @{ bitmap = $bmp; graphics = $g }
 }
 
-if ($printed -and -not (Test-MostlyBlackBitmap -Bitmap $bitmap)) {
-  $method = 'printwindow'
-} else {
-  $bitmap.Dispose()
-  $graphics.Dispose()
-  $fallbackWidth = $windowWidth
-  $fallbackHeight = $windowHeight
-  $fallbackLeft = $windowRect.Left
-  $fallbackTop = $windowRect.Top
-  if ($captureRegion -eq 'client') {
-    $fallbackWidth = $cropWidth
-    $fallbackHeight = $cropHeight
-    $fallbackLeft = $clientScreenLeft
-    $fallbackTop = $clientScreenTop
+$bitmap = $null
+$graphics = $null
+$method = $null
+
+# 1) Superficie de emulación (hijo más grande) o la ventana si no hay hijo.
+$targetHwnd = if ($bestChildHwnd -ne [IntPtr]::Zero) { $bestChildHwnd } else { $hWnd }
+$targetWidth = if ($bestChildRect -ne $null) { $cropWidth } else { $windowWidth }
+$targetHeight = if ($bestChildRect -ne $null) { $cropHeight } else { $windowHeight }
+$shot = Capture-WithPrintWindow -hwnd $targetHwnd -width $targetWidth -height $targetHeight
+if ($shot -ne $null) {
+  $bitmap = $shot.bitmap; $graphics = $shot.graphics; $method = 'printwindow'
+  $cropLeft = 0; $cropTop = 0; $cropWidth = $targetWidth; $cropHeight = $targetHeight
+  $captureRegion = 'client'
+  $windowWidth = $targetWidth; $windowHeight = $targetHeight
+}
+# 2) Reintento sobre la ventana completa (algún backend no pinta el hijo).
+if ($bitmap -eq $null) {
+  $shot = Capture-WithPrintWindow -hwnd $hWnd -width $windowWidth -height $windowHeight
+  if ($shot -ne $null) {
+    $bitmap = $shot.bitmap; $graphics = $shot.graphics; $method = 'printwindow'
+    $cropLeft = 0; $cropTop = 0; $cropWidth = $windowWidth; $cropHeight = $windowHeight
+    $captureRegion = 'window'
   }
-  $bitmap = New-Object System.Drawing.Bitmap($fallbackWidth, $fallbackHeight)
+}
+# 3) Último recurso: copia de pantalla, con la ventana al frente DE VERDAD.
+if ($bitmap -eq $null) {
+  for ($t = 0; $t -lt 20; $t++) {
+    [void][WinUaeCaptureNative]::ShowWindow($hWnd, 9)
+    [void][WinUaeCaptureNative]::SetForegroundWindow($hWnd)
+    if ([WinUaeCaptureNative]::GetForegroundWindow() -eq $hWnd) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  $origin2 = New-Object WinUaeCaptureNative+POINT
+  $origin2.X = 0; $origin2.Y = 0
+  [void][WinUaeCaptureNative]::ClientToScreen($hWnd, [ref]$origin2)
+  $fbLeft = $origin2.X; $fbTop = $origin2.Y; $fbW = $cropWidth; $fbH = $cropHeight
+  if ($captureRegion -ne 'client') {
+    $fbLeft = $windowRect.Left; $fbTop = $windowRect.Top
+    $fbW = $windowWidth; $fbH = $windowHeight
+  }
+  $bitmap = New-Object System.Drawing.Bitmap($fbW, $fbH)
   $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-  $graphics.CopyFromScreen($fallbackLeft, $fallbackTop, 0, 0, $bitmap.Size)
+  $graphics.CopyFromScreen($fbLeft, $fbTop, 0, 0, $bitmap.Size)
   $method = 'screen_copy'
-  if ($captureRegion -eq 'client') {
-    $windowWidth = $fallbackWidth
-    $windowHeight = $fallbackHeight
-    $cropLeft = 0
-    $cropTop = 0
-  }
+  $cropLeft = 0; $cropTop = 0; $cropWidth = $fbW; $cropHeight = $fbH
+  $windowWidth = $fbW; $windowHeight = $fbH
 }
 
 $outputBitmap = $bitmap
