@@ -260,6 +260,11 @@ export class GdbProtocol {
 
   /**
    * Send a command and wait for response
+   *
+   * IMPORTANTE (evita desincronización de la cola): si el comando expira, su respuesta
+   * puede llegar DESPUÉS y resolvería al comando SIGUIENTE de la cola FIFO. En cuanto un
+   * comando expira, la conexión queda en estado indeterminado: se rechazan todos los
+   * pendientes y se tira el socket (el llamador deberá reconectar).
    */
   private sendCommand(command: string, timeoutMs: number = 10000): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -268,12 +273,38 @@ export class GdbProtocol {
         if (idx >= 0) {
           this.packetResolvers.splice(idx, 1);
         }
-        reject(new Error(`GDB command timeout: ${command}`));
+        const error = new Error(`GDB command timeout: ${command}`);
+        this.rejectAll(new Error('GDB connection desynchronized after command timeout'));
+        this.destroySocket();
+        reject(error);
       }, timeoutMs);
 
       this.packetResolvers.push({ resolve, reject, timer });
-      this.sendPacket(command);
+      try {
+        this.sendPacket(command);
+      } catch (err) {
+        clearTimeout(timer);
+        const idx = this.packetResolvers.findIndex(r => r.resolve === resolve);
+        if (idx >= 0) {
+          this.packetResolvers.splice(idx, 1);
+        }
+        reject(err as Error);
+      }
     });
+  }
+
+  private destroySocket(): void {
+    if (this.socket) {
+      const sock = this.socket;
+      this.socket = null;
+      this.pendingData = '';
+      this.pendingStopReply = null;
+      try {
+        sock.destroy();
+      } catch {
+        // best-effort
+      }
+    }
   }
 
   /**
@@ -285,9 +316,10 @@ export class GdbProtocol {
   }
 
   private socketWrite(data: string): void {
-    if (this.socket && !this.socket.destroyed) {
-      this.socket.write(data, 'binary');
+    if (!this.socket || this.socket.destroyed) {
+      throw new Error('GDB socket is closed (connection was dropped after a timeout); reconnect with winuae_connect/winuae_connect_existing');
     }
+    this.socket.write(data, 'binary');
   }
 
   private debug(msg: string): void {
@@ -357,24 +389,54 @@ export class GdbProtocol {
   // ─── Memory Commands ────────────────────────────────────────────────
 
   /**
-   * Read memory: sends 'm<addr>,<len>', returns Buffer
+   * Read memory: sends 'm<addr>,<len>', returns Buffer.
+   *
+   * Presupuesto total (`WINUAE_GDB_READ_TOTAL_BUDGET_MS`, por defecto 90 s) y corte rápido
+   * tras 2 timeouts consecutivos: una lectura grande (p. ej. 256 KiB) NUNCA debe poder
+   * bloquear el servidor durante minutos (chunks × timeout). Cada chunk verifica que la
+   * respuesta tenga la longitud pedida (un stub que trunca daría datos silenciosamente
+   * incompletos).
    */
   async readMemory(addr: number, length: number): Promise<Buffer> {
     if (length <= 0) {
       return Buffer.alloc(0);
     }
-    const chunkSize = Math.max(1, parseInt(process.env.WINUAE_GDB_READ_CHUNK_SIZE || '1024', 10) || 1024);
+    const chunkSize = Math.max(1, parseInt(process.env.WINUAE_GDB_READ_CHUNK_SIZE || '4096', 10) || 4096);
     const baseTimeoutMs = Math.max(1000, parseInt(process.env.WINUAE_GDB_READ_TIMEOUT_MS || '20000', 10) || 20000);
     const timeoutPerKbMs = Math.max(0, parseInt(process.env.WINUAE_GDB_READ_TIMEOUT_PER_KB_MS || '1500', 10) || 1500);
+    const totalBudgetMs = Math.max(1000, parseInt(process.env.WINUAE_GDB_READ_TOTAL_BUDGET_MS || '90000', 10) || 90000);
+    const startedAt = Date.now();
+    let consecutiveTimeouts = 0;
 
     const readChunk = async (chunkAddr: number, chunkLength: number): Promise<Buffer> => {
-      const timeoutMs = baseTimeoutMs + Math.ceil(chunkLength / 1024) * timeoutPerKbMs;
+      const timeoutMs = Math.min(
+        baseTimeoutMs + Math.ceil(chunkLength / 1024) * timeoutPerKbMs,
+        Math.max(1000, totalBudgetMs - (Date.now() - startedAt))
+      );
       trace(`readMemory chunk addr=$${chunkAddr.toString(16)} len=${chunkLength} timeout=${timeoutMs}ms`);
-      const reply = await this.sendCommand(`m${chunkAddr.toString(16)},${chunkLength.toString(16)}`, timeoutMs);
+      let reply: string;
+      try {
+        reply = await this.sendCommand(`m${chunkAddr.toString(16)},${chunkLength.toString(16)}`, timeoutMs);
+        consecutiveTimeouts = 0;
+      } catch (err) {
+        consecutiveTimeouts += 1;
+        if (consecutiveTimeouts >= 2) {
+          throw new Error(
+            `Memory read aborted after ${consecutiveTimeouts} consecutive timeouts at $${chunkAddr.toString(16)}: ${(err as Error).message}`
+          );
+        }
+        throw err;
+      }
       if (reply.startsWith('E')) {
         throw new Error(`Memory read error at $${chunkAddr.toString(16)}: ${reply}`);
       }
-      return Buffer.from(reply, 'hex');
+      const buffer = Buffer.from(reply, 'hex');
+      if (buffer.length !== chunkLength) {
+        throw new Error(
+          `Memory read truncated at $${chunkAddr.toString(16)}: got ${buffer.length} of ${chunkLength} bytes`
+        );
+      }
+      return buffer;
     };
 
     if (length <= chunkSize) {
@@ -383,6 +445,11 @@ export class GdbProtocol {
 
     const chunks: Buffer[] = [];
     for (let offset = 0; offset < length; offset += chunkSize) {
+      if (Date.now() - startedAt > totalBudgetMs) {
+        throw new Error(
+          `Memory read budget exceeded (${totalBudgetMs}ms) at $${(addr + offset).toString(16)} of ${length} bytes`
+        );
+      }
       const chunkLength = Math.min(chunkSize, length - offset);
       chunks.push(await readChunk(addr + offset, chunkLength));
     }
